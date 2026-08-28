@@ -1,0 +1,25 @@
+# IDE
+.idea/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/*.png
+
+# Data / secrets
+data/
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Nested / separate repos
+MiniCode-PI/
+wireless_comm_ai/
