@@ -67,6 +67,17 @@
           </div>
         </div>
 
+        <article v-else-if="block.type === 'subagent'" :class="['agent-subagent', block.status]">
+          <header><span>⇢</span><strong>{{ block.name || "子代理任务" }}</strong><small>{{ subagentStatus(block.status) }}</small></header>
+          <p v-if="block.focus">{{ block.focus }}</p>
+          <details v-if="block.progress.length">
+            <summary>{{ block.progress.length }} 条进度</summary>
+            <pre>{{ block.progress.map(item => formatEvent(item)).join("\n") }}</pre>
+          </details>
+          <pre v-if="block.result">{{ block.result }}</pre>
+          <pre v-if="block.error" class="agent-subagent-error">{{ block.error }}</pre>
+        </article>
+
         <div v-else class="agent-note">
           <span>{{ eventLabel(block.event.event) }}</span>
           <pre>{{ formatEvent(block.event.content) }}</pre>
@@ -88,6 +99,7 @@ const outputLimit = 1600;
 const blocks = computed(() => {
   const items = [];
   const tools = new Map();
+  const subagents = new Map();
   let thinking = null;
   for (const event of props.turn.events || []) {
     if (event.event === "thinking") {
@@ -120,6 +132,27 @@ const blocks = computed(() => {
     if (event.event === "llm_response") {
       const text = String(event.content?.text || "").trim();
       if (text) items.push({ type: "response", key: `response-${event.id}`, text });
+      continue;
+    }
+    if (event.event === "subagent_started") {
+      const block = { type: "subagent", key: `subagent-${event.content?.id || event.id}`, id: event.content?.id, name: event.content?.name, focus: event.content?.focus, status: "running", progress: [], result: "", error: "" };
+      subagents.set(String(block.id || ""), block);
+      items.push(block);
+      continue;
+    }
+    if (event.event === "subagent_progress") {
+      const owner = subagents.get(String(event.content?.id || ""));
+      if (owner) owner.progress.push(event.content);
+      else items.push({ type: "note", key: `subagent-progress-${event.id}`, event });
+      continue;
+    }
+    if (event.event === "subagent_finished") {
+      const owner = subagents.get(String(event.content?.id || ""));
+      if (owner) {
+        owner.status = event.content?.status || "completed";
+        owner.result = event.content?.result || "";
+        owner.error = event.content?.error || "";
+      } else items.push({ type: "note", key: `subagent-finished-${event.id}`, event });
       continue;
     }
     if (event.event !== "turn_start" && event.event !== "turn_end") {
@@ -224,6 +257,10 @@ function formatEvent(content) {
 }
 
 function eventLabel(type) {
-  return ({ status: "状态", sources: "来源", approval_required: "审批", hook: "Hook", error: "错误", result: "结果", queued_message: "追加指令", context_compacted: "上下文压缩", memory_updated: "记忆已更新", memory_recalled: "已召回记忆" })[type] || type;
+  return ({ status: "状态", sources: "来源", approval_required: "审批", hook: "Hook", error: "错误", result: "结果", queued_message: "追加指令", context_compacted: "上下文压缩", memory_updated: "记忆已更新", memory_recalled: "已召回记忆", memory_extraction_queued: "记忆后台提取", subagent_started: "子代理启动", subagent_progress: "子代理进度", subagent_finished: "子代理完成", mcp_discovery: "MCP 发现" })[type] || type;
+}
+
+function subagentStatus(status) {
+  return ({ running: "运行中", completed: "已完成", failed: "失败", cancelled: "已取消" })[status] || status;
 }
 </script>

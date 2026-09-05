@@ -7,9 +7,9 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.core.memory import MemoryService
-from app.infra.database import Base
-from app.packages.ai import ModelResponse
+from app.extensions.builtin.memory import MemoryService
+from app.platform.database import Base
+from app.providers import ModelResponse
 
 
 class FakeIndex:
@@ -52,7 +52,7 @@ def service(tmp_path, monkeypatch):
     engine = create_engine(f"sqlite:///{tmp_path / 'memory.db'}")
     Base.metadata.create_all(engine)
     session = sessionmaker(bind=engine, autocommit=False, autoflush=False)
-    monkeypatch.setattr("app.core.memory.SessionLocal", session)
+    monkeypatch.setattr("app.extensions.builtin.memory.service.SessionLocal", session)
     result = MemoryService()
     result.index = FakeIndex()
     return result

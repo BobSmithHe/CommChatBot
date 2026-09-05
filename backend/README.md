@@ -10,27 +10,37 @@ Clean FastAPI backend with two chat modes:
 ```text
 app/
   main.py                 FastAPI entrypoint and HTTP/SSE API
-  services.py             ProductGateway for API-facing orchestration
-  infra/                  config, MySQL/SQLite, auth
-  packages/
-    ai/                   low-level model provider contracts/adapters
-    agent/                reusable MiniCode-style AgentRuntime
+  bootstrap/container.py  the only application composition root
+  services.py             compatibility accessors into the bootstrap container
+  infra/                  configuration, token primitives, observability adapters
+  providers/              low-level model provider contracts/adapters
+  agent_runtime/          portable AgentRuntime Core + host protocol + local/remote SDK
+  platform/
+    database.py           MySQL/SQLite schema and sessions
+    services/             auth, task queue/runtime, Redis events, scheduler, notifications
+    agent_host.py         platform adapter for AgentRuntimeHost
+  extensions/
+    builtin/              vertical extension slices: manifest, activation and implementation
+    support/              shared attachment, document, execution and sandbox helpers
   products/
-    chatbot.py            chatbot workflow: direct RAG and chat-agent mode
-    coding_agent.py       coding-agent workflow: tools + runtime prompt
-  core/
-    rag/                  local hybrid RAG + optional Milvus mirror
-    code/                 Python execution capability
+    profiles.py           declarative Chat and Coding capability selection
+    chatbot.py            thin Chat profile shell
+    coding_agent.py       thin Coding profile shell
 ```
 
 The runtime mirrors MiniCode-PI's package boundary:
 
 ```text
-API -> ProductGateway -> ChatbotMode | CodingAgentMode
-                     -> packages.agent.AgentRuntime
-                     -> packages.ai.ModelProvider
-                     -> Product tools (RAG / Web / Python)
+AI Provider -> AgentRuntime Core -> Extension Host API -> Built-in Extensions
+                               \-> PlatformAgentRuntimeHost -> Platform Services
+ProductGateway -> Chat | Coding Profile -> ExtensionRegistry -> AgentRuntime
 ```
+
+`agent_runtime` has no imports from FastAPI, the database, Redis, product modes,
+or concrete extensions. `providers` does not read application configuration, products
+depend on ports and immutable profile configuration, and platform services never import
+API routes. The previous catch-all `app/core/`, `app/packages/`, and horizontal
+`extensions/capabilities/` directories were removed.
 
 ## Run
 
@@ -60,7 +70,7 @@ TAVILY_API_KEY=...
 Mode boundaries:
 
 - `chatbot`: optional local RAG and Tavily web search.
-- `coding-agent`: workspace file listing, reading, searching, creation, exact replacement, atomic unified-diff patches, automatic LSP/Ruff feedback, diff review, bounded project verification commands, task plans, read-only sub-agent delegation, durable per-project memory, and temporary-directory Python execution. It never receives RAG or web-search tools.
+- `coding-agent`: workspace file listing, reading, searching, creation, exact replacement, atomic unified-diff patches, automatic LSP/Ruff feedback, diff review, bounded project verification commands, task plans, persistent inspectable read-only child-agent trees, durable per-project memory, and temporary-directory Python execution. It never receives RAG or web-search tools.
 
 Runtime safety and recovery:
 
@@ -82,7 +92,8 @@ Runtime safety and recovery:
 - Docker mode places code, verification commands, and interactive workspace terminals in non-root containers with no network, a read-only root, one workspace bind mount, dropped capabilities, and memory/CPU/PID/output limits. Windows Job Objects remain the `restricted` fallback.
 - Long histories are compacted into a durable rolling summary while recent turns remain verbatim. Near the model limit, the active LLM creates a structured goal/decisions/files/errors/next-steps summary; every call still enforces `MODEL_CONTEXT_TOKENS`.
 - Trusted Coding projects discover `AGENTS.md`, declarative `SKILL.md` instructions and JSON extension manifests. Trust is explicit; project content is never imported as executable server-side Python, and extension commands still pass through existing permission and sandbox enforcement.
-- Per-call token/cache/cost usage is stored with task and conversation ids and aggregated by `GET /api/tasks/{task_id}`. `packages.agent.sdk` exposes a small programmatic session API.
+- Per-call token/cache/cost usage is stored with task and conversation ids and aggregated by `GET /api/tasks/{task_id}`. `agent_runtime.sdk` exposes the in-process session API and `agent_runtime.remote_sdk` provides an async HTTP/SSE client for tasks, steering, cancellation and child-agent control.
+- Extension Runtime v2 validates manifests, JSON Schema configuration and declared permissions, supports trusted installed entrypoints, unregister and reverse lifecycle deactivation.
 - Local RAG uses conservative intent routing, contextual follow-up query rewriting, and separate lexical/dense relevance thresholds. Greetings, assistant-meta prompts, creative tasks, and real-time questions do not query the knowledge base; weak Milvus nearest-neighbor results are discarded before fusion.
 - Short-term memory consists of account-scoped conversation messages, Agent checkpoints/task mailbox state, and durable structured context summaries. Governed long-term memory is stored in MySQL at user/project/conversation/task scope, with optional Milvus semantic recall. A conservative post-answer extractor records confidence, importance, TTL, provenance, revision history, and merges near-duplicates; credential-like content is rejected. Per-account privacy settings control capture, recall, and each scope, while explicit delete/clear operations permanently remove database records.
 
@@ -113,6 +124,7 @@ The container never receives the host's model/database credentials or Docker soc
 - `POST /api/conversations/{id}/fork`, `GET /api/conversations/{id}/branches`, `POST /api/conversations/{id}/branches/{branch_id}/restore`
 - `PATCH /api/conversations/{id}/trust`, `GET /api/conversations/{id}/project-context`
 - `POST /api/tasks/{task_id}/messages` for persistent `steering` / `follow_up`
+- `GET /api/tasks/{task_id}/subtasks/{subtask_id}`, child `/messages`, and `/interrupt`
 - `/api/tasks/*`, `/api/models`, `/health/integrations`
 - `GET/PATCH /api/memories/settings`, `GET/POST/DELETE /api/memories`, `PATCH/DELETE /api/memories/{id}`, `GET /api/memories/recall`
 

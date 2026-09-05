@@ -1195,6 +1195,43 @@ body.resize-terminal {
   white-space: pre-wrap;
 }
 
+.agent-subagent {
+  border: 1px solid #d9d2ea;
+  border-left: 3px solid #7c5cc4;
+  border-radius: 8px;
+  padding: 9px 11px;
+  background: #fcfaff;
+  font-size: 11px;
+}
+
+.agent-subagent header { display: flex; align-items: center; gap: 8px; }
+.agent-subagent header small { margin-left: auto; color: #746e7f; }
+.agent-subagent p { margin: 7px 0; color: #746e7f; }
+.agent-subagent pre { margin: 7px 0 0; max-height: 240px; overflow: auto; white-space: pre-wrap; }
+.agent-subagent.completed { border-left-color: #2f8067; }
+.agent-subagent.failed { border-left-color: #b84a45; }
+.agent-subagent-error { color: #b84a45; }
+
+.operations-dialog { width: min(1080px, calc(100vw - 36px)); max-height: calc(100vh - 36px); overflow: auto; }
+.automation-form { display: grid; gap: 8px; padding: 12px; border: 1px solid #e0ddd6; border-radius: 8px; }
+.automation-form > div { display: flex; align-items: center; gap: 10px; }
+.automation-form label { display: flex; align-items: center; gap: 6px; }
+.automation-form input, .automation-form textarea, .automation-form select { border: 1px solid #d6d1c8; border-radius: 6px; padding: 7px 9px; font: inherit; }
+.automation-form textarea { resize: vertical; }
+.operations-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; min-height: 240px; overflow: auto; }
+.operations-columns h3 { display: flex; align-items: center; gap: 6px; margin: 12px 0 8px; font-size: 13px; }
+.operation-item { margin-bottom: 7px; cursor: default; }
+.operation-item > small { display: block; color: #777168; }
+.operation-item > div { display: flex; gap: 6px; }
+.operation-item.unread { border-left: 3px solid #7c5cc4; cursor: pointer; }
+.operations-integrations { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; border-top: 1px solid #e0ddd6; margin-top: 10px; }
+.operations-integrations h3 { display: flex; align-items: center; gap: 6px; font-size: 13px; }
+.automation-form.compact { padding: 8px; margin-bottom: 8px; }
+.automation-form.compact > div { flex-wrap: wrap; }
+.automation-form.compact input { min-width: 120px; flex: 1; }
+@media (max-width: 760px) { .operations-columns { grid-template-columns: 1fr; } }
+@media (max-width: 760px) { .operations-integrations { grid-template-columns: 1fr; } }
+
 .trace-event {
   display: grid;
   grid-template-columns: 66px minmax(0, 1fr);

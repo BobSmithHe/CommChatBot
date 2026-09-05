@@ -9,12 +9,12 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from ...infra.database import Conversation, Message, SessionLocal, User, ensure_anonymous_user, get_db
+from ...platform.database import Conversation, Message, SessionLocal, User, ensure_anonymous_user, get_db
 from ...infra.config import get_settings
 from ...infra.security import decode_access_token
-from ...core.workspace.terminal import terminal_manager
-from ...core.workspace.language import WorkspaceLanguageService
-from ...core.project_context import project_context_loader
+from ...extensions.builtin.terminal.session import terminal_manager
+from ...extensions.builtin.workspace.language import WorkspaceLanguageService
+from ...extensions.builtin.project_context import project_context_loader
 from ...sse import sse
 from ..conversation_utils import (
     conversation_payload,

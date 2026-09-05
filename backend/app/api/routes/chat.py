@@ -8,9 +8,10 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from ...infra.config import get_settings
-from ...infra.database import AgentTask, Message, RuntimeEventRecord, SessionLocal, User, get_db
-from ...core.runtime_state import runtime_task_manager
-from ...core.task_queue import task_queue
+from ...platform.database import AgentTask, Message, RuntimeEventRecord, SessionLocal, User, get_db
+from ...platform.services.task_runtime import runtime_task_manager
+from ...platform.services.task_queue import task_queue
+from ...platform.services.event_bus import event_bus
 from ...services import get_chat_attachment_store
 from ...sse import sse
 from ..conversation_utils import conversation_history, ensure_conversation_workspace, get_or_create_conversation
@@ -119,37 +120,77 @@ async def chat_stream(req: ChatRequest, user: User = Depends(current_user), db: 
 
     async def events():
         yield sse("task", {"task_id": task.id, "status": "running", "resumed": resumed})
-        cursor = 0
+        db_cursor = 0
+        stream_cursor = "0-0"
         idle_ticks = 0
         error_sent = False
+        seen_event_keys: set[str] = set()
         terminal_statuses = {"completed", "failed", "cancelled", "interrupted"}
         while True:
-            with SessionLocal() as read_db:
-                rows = read_db.query(RuntimeEventRecord).filter(
-                    RuntimeEventRecord.task_id == task.id,
-                    RuntimeEventRecord.id > cursor,
-                ).order_by(RuntimeEventRecord.id).limit(200).all()
-                current = read_db.query(AgentTask.status, AgentTask.error).filter(AgentTask.id == task.id).first()
-                status = current[0] if current else "failed"
-                task_error = current[1] if current else "Task record no longer exists"
-                serialized = [(row.id, row.event_type, row.content_json) for row in rows]
-            for event_id, event_type, raw_content in serialized:
-                cursor = event_id
-                try:
-                    content = json.loads(raw_content) if raw_content is not None else ""
-                except json.JSONDecodeError:
-                    content = raw_content or ""
+            streamed = await asyncio.to_thread(
+                event_bus.read,
+                task.id,
+                stream_cursor,
+                block_ms=750,
+                count=200,
+            )
+            serialized: list[tuple[str, str, object]] = []
+            if streamed is not None:
+                stream_cursor, bus_events = streamed
+                serialized = [
+                    (str(item.get("event_key") or ""), str(item.get("event") or "status"), item.get("content"))
+                    for item in bus_events
+                ]
+            else:
+                # Redis is optional. The durable database remains a complete
+                # compatibility fallback during an outage.
+                with SessionLocal() as read_db:
+                    rows = read_db.query(RuntimeEventRecord).filter(
+                        RuntimeEventRecord.task_id == task.id,
+                        RuntimeEventRecord.id > db_cursor,
+                    ).order_by(RuntimeEventRecord.id).limit(200).all()
+                    serialized = [
+                        (str(row.event_key or f"db-{row.id}"), row.event_type, row.content_json)
+                        for row in rows
+                    ]
+                if rows:
+                    db_cursor = max(db_cursor, max(row.id for row in rows))
+
+            emitted = False
+            for event_key, event_type, raw_content in serialized:
+                if event_key and event_key in seen_event_keys:
+                    continue
+                if event_key:
+                    seen_event_keys.add(event_key)
+                if streamed is None:
+                    try:
+                        content = json.loads(raw_content) if raw_content is not None else ""
+                    except json.JSONDecodeError:
+                        content = raw_content or ""
+                else:
+                    content = raw_content
                 if event_type == "error":
                     error_sent = True
                 yield sse(event_type, content)
-            if status in terminal_statuses and not serialized:
+                emitted = True
+
+            if emitted:
+                continue
+            with SessionLocal() as read_db:
+                current = read_db.query(AgentTask.status, AgentTask.error).filter(
+                    AgentTask.id == task.id
+                ).first()
+            status = current[0] if current else "failed"
+            task_error = current[1] if current else "Task record no longer exists"
+            if status in terminal_statuses:
                 if status == "failed" and not error_sent:
                     yield sse("error", task_error or "Task failed")
                 break
             idle_ticks += 1
             if idle_ticks % 100 == 0:
                 yield ": keep-alive\n\n"
-            await asyncio.sleep(max(0.05, get_settings().task_event_poll_ms / 1000))
+            if streamed is None:
+                await asyncio.sleep(max(0.05, get_settings().task_event_poll_ms / 1000))
         yield sse("done")
 
     return StreamingResponse(events(), media_type="text/event-stream")

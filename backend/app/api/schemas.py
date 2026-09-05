@@ -169,3 +169,67 @@ class GitCheckpointRequest(BaseModel):
 
 class WorkspaceTrashRestoreRequest(BaseModel):
     trash_id: str = Field(min_length=32, max_length=32)
+
+
+class AutomationCreateRequest(BaseModel):
+    conversation_id: int = Field(ge=1)
+    name: str = Field(min_length=1, max_length=160)
+    prompt: str = Field(min_length=1, max_length=20_000)
+    interval_seconds: int = Field(default=3600, ge=60, le=31_536_000)
+    rrule: str | None = Field(default=None, max_length=1000)
+    timezone: str = Field(default="UTC", min_length=1, max_length=80)
+    notification_policy: Literal["completion", "failure", "none"] = "completion"
+
+
+class AutomationUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=160)
+    prompt: str | None = Field(default=None, min_length=1, max_length=20_000)
+    interval_seconds: int | None = Field(default=None, ge=60, le=31_536_000)
+    rrule: str | None = Field(default=None, max_length=1000)
+    timezone: str | None = Field(default=None, min_length=1, max_length=80)
+    status: Literal["active", "paused"] | None = None
+    notification_policy: Literal["completion", "failure", "none"] | None = None
+
+
+class NotificationEndpointCreateRequest(BaseModel):
+    kind: Literal["webhook", "email"]
+    name: str = Field(min_length=1, max_length=120)
+    target: str = Field(min_length=3, max_length=2000)
+    secret: str | None = Field(default=None, max_length=255)
+
+
+class NotificationEndpointUpdateRequest(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=120)
+    target: str | None = Field(default=None, min_length=3, max_length=2000)
+    secret: str | None = Field(default=None, max_length=255)
+    enabled: bool | None = None
+
+
+class GitHubSubscriptionRequest(BaseModel):
+    repository: str = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", max_length=250)
+
+
+class GitHubInlineReviewRequest(BaseModel):
+    repository: str = Field(pattern=r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", max_length=250)
+    number: int = Field(ge=1)
+    body: str = Field(default="", max_length=65_000)
+    event: Literal["COMMENT", "APPROVE", "REQUEST_CHANGES"] = "COMMENT"
+    commit_id: str | None = Field(default=None, max_length=80)
+    comments: list[dict] = Field(default_factory=list, max_length=100)
+
+
+class RemoteRunnerHeartbeatRequest(BaseModel):
+    runner_id: str | None = Field(default=None, min_length=32, max_length=32)
+    name: str = Field(min_length=1, max_length=120)
+    capabilities: dict = Field(default_factory=dict)
+
+
+class RemoteJobCreateRequest(BaseModel):
+    runner_id: str = Field(min_length=32, max_length=32)
+    argv: list[str] = Field(min_length=1, max_length=100)
+    timeout: int = Field(default=300, ge=1, le=3600)
+
+
+class RemoteJobCompleteRequest(BaseModel):
+    output: str = Field(default="", max_length=2_000_000)
+    exit_code: int

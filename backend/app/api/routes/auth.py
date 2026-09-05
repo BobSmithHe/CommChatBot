@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 
-from ...core.auth_security import (
+from ...platform.services.auth import (
     AuthRateLimitError,
     audit_auth,
     auth_rate_limiter,
@@ -14,7 +14,7 @@ from ...core.auth_security import (
     rotate_refresh_token,
 )
 from ...infra.config import get_settings
-from ...infra.database import AuthAuditRecord, User, get_db
+from ...platform.database import AuthAuditRecord, User, get_db
 from ...infra.security import hash_password, verify_password
 from ..deps import current_user
 from ..schemas import (

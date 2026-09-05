@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 import os
 import sqlite3
 import subprocess
@@ -12,7 +14,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from app.infra.database import init_db
+from app.platform.database import init_db
 from app.main import app
 
 
@@ -127,7 +129,7 @@ def concurrency_scenario(client: TestClient) -> None:
 
 def external_worker_recovery_scenario(client: TestClient) -> None:
     """A separate worker must recover and finish an API task after process loss."""
-    from app.infra.database import AgentTask, Message, SessionLocal
+    from app.platform.database import AgentTask, Message, SessionLocal
 
     _account, session = register_and_login(client, "worker")
     auth = headers(session)
@@ -230,7 +232,7 @@ def terminal_websocket_scenario(client: TestClient) -> None:
 
 
 def framework_features_scenario(client: TestClient) -> None:
-    from app.infra.database import AgentTask, Message, SessionLocal, TaskMailboxMessage
+    from app.platform.database import AgentTask, Message, SessionLocal, TaskMailboxMessage
 
     _account, session = register_and_login(client, "framework")
     auth = headers(session)
@@ -302,6 +304,132 @@ def framework_features_scenario(client: TestClient) -> None:
     assert client.delete(f"/api/memories/{memory['id']}", headers=auth).status_code == 200
 
 
+def platform_scenario(client: TestClient) -> None:
+    from app.platform.services.task_runtime import runtime_task_manager
+
+    _account, session = register_and_login(client, "platform")
+    auth = headers(session)
+    catalog = client.get("/api/extensions").json()
+    assert "chat.rag" in catalog["profiles"]["chatbot"]
+    assert "coding.workspace" in catalog["profiles"]["coding"]
+    conversation = client.post("/api/conversations", headers=auth, json={"mode": "chatbot"}).json()
+    automation = client.post("/api/platform/automations", headers=auth, json={
+        "conversation_id": conversation["id"], "name": "health report",
+        "prompt": "Summarize the project health", "interval_seconds": 3600,
+        "notification_policy": "completion",
+    })
+    assert automation.status_code == 200, automation.text
+    calendar = client.post("/api/platform/automations", headers=auth, json={
+        "conversation_id": conversation["id"], "name": "daily health",
+        "prompt": "Daily health", "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+        "timezone": "Asia/Shanghai", "notification_policy": "none",
+    })
+    assert calendar.status_code == 200 and calendar.json()["rrule"].startswith("FREQ=DAILY")
+    invalid_calendar = client.post("/api/platform/automations", headers=auth, json={
+        "conversation_id": conversation["id"], "name": "invalid timezone",
+        "prompt": "Never queued", "rrule": "FREQ=DAILY", "timezone": "Mars/Olympus",
+    })
+    assert invalid_calendar.status_code == 422
+    triggered = client.post(
+        f"/api/platform/automations/{automation.json()['id']}/run", headers=auth,
+    )
+    assert triggered.status_code == 200 and triggered.json()["task_id"]
+    runtime_task_manager.finish(triggered.json()["task_id"], "completed")
+    notifications = client.get("/api/platform/notifications?unread_only=true", headers=auth).json()
+    assert notifications and notifications[0]["task_id"] == triggered.json()["task_id"]
+    subtask_id = runtime_task_manager.create_subtask(
+        triggered.json()["task_id"], "inspect tests", "read-only", model="eval-model",
+    )
+    runtime_task_manager.update_subtask(
+        triggered.json()["task_id"], subtask_id, "completed", result="all clear",
+    )
+    tree = client.get(f"/api/tasks/{triggered.json()['task_id']}/subtasks", headers=auth)
+    assert tree.status_code == 200 and tree.json()[0]["result"] == "all clear"
+    live_subtask_id = runtime_task_manager.create_subtask(
+        triggered.json()["task_id"], "inspect runtime", "messages", model="eval-model",
+        status="running", request={"task": "inspect runtime", "focus": "messages"},
+    )
+    runtime_task_manager.save_subtask_checkpoint(
+        triggered.json()["task_id"], live_subtask_id,
+        {"version": 2, "phase": "before_llm", "next_turn": 1, "messages": []},
+    )
+    child = client.get(
+        f"/api/tasks/{triggered.json()['task_id']}/subtasks/{live_subtask_id}", headers=auth,
+    )
+    assert child.status_code == 200 and child.json()["has_checkpoint"] is True
+    child_message = client.post(
+        f"/api/tasks/{triggered.json()['task_id']}/subtasks/{live_subtask_id}/messages",
+        headers=auth, json={"kind": "steering", "content": "focus on recovery"},
+    )
+    assert child_message.status_code == 200
+    consumed = runtime_task_manager.consume_subtask_messages(
+        triggered.json()["task_id"], live_subtask_id, ("steering",),
+    )
+    assert consumed[0]["content"] == "focus on recovery"
+    interrupted = client.post(
+        f"/api/tasks/{triggered.json()['task_id']}/subtasks/{live_subtask_id}/interrupt",
+        headers=auth,
+    )
+    assert interrupted.status_code == 200 and interrupted.json()["status"] == "cancelled"
+
+    endpoint = client.post("/api/platform/notification-endpoints", headers=auth, json={
+        "kind": "email", "name": "ops", "target": "ops@example.test",
+    })
+    assert endpoint.status_code == 200
+    assert client.get("/api/platform/notification-endpoints", headers=auth).json()[0]["name"] == "ops"
+    subscription = client.post("/api/platform/github/subscriptions", headers=auth, json={
+        "repository": "openai/codex",
+    })
+    assert subscription.status_code == 200
+    webhook_body = json.dumps({
+        "action": "opened", "repository": {"full_name": "openai/codex"},
+        "pull_request": {"number": 42},
+    }).encode()
+    signature = "sha256=" + hmac.new(b"integration-webhook-secret", webhook_body, hashlib.sha256).hexdigest()
+    webhook = client.post("/api/platform/github/webhook", content=webhook_body, headers={
+        "X-Hub-Signature-256": signature, "X-GitHub-Delivery": uuid.uuid4().hex,
+        "X-GitHub-Event": "pull_request", "Content-Type": "application/json",
+    })
+    assert webhook.status_code == 200 and webhook.json()["notifications"] == 1
+    duplicate = client.post("/api/platform/github/webhook", content=webhook_body, headers={
+        "X-Hub-Signature-256": signature,
+        "X-GitHub-Delivery": webhook.request.headers["X-GitHub-Delivery"],
+        "X-GitHub-Event": "pull_request", "Content-Type": "application/json",
+    })
+    assert duplicate.status_code == 200 and duplicate.json()["duplicate"] is True
+    assert client.post("/api/platform/github/webhook", content=webhook_body, headers={
+        "X-Hub-Signature-256": "sha256=invalid", "X-GitHub-Event": "pull_request",
+    }).status_code == 401
+
+    runner_auth = {"X-Runner-Token": "integration-runner-secret"}
+    unsafe = client.post("/api/platform/remote/runner/heartbeat", headers=runner_auth, json={
+        "name": "unsafe-runner", "capabilities": {"os": "test", "isolated": False},
+    })
+    unsafe_job = client.post("/api/platform/remote/jobs", headers=auth, json={
+        "runner_id": unsafe.json()["runner_id"], "argv": ["python", "-V"], "timeout": 30,
+    })
+    assert unsafe_job.status_code == 409
+    heartbeat = client.post("/api/platform/remote/runner/heartbeat", headers=runner_auth, json={
+        "name": "ci-runner", "capabilities": {"os": "test", "isolated": True, "sandbox": "test"},
+    })
+    assert heartbeat.status_code == 200, heartbeat.text
+    runner_id = heartbeat.json()["runner_id"]
+    job = client.post("/api/platform/remote/jobs", headers=auth, json={
+        "runner_id": runner_id, "argv": ["python", "-V"], "timeout": 30,
+    })
+    assert job.status_code == 200, job.text
+    claimed = client.post(
+        f"/api/platform/remote/runner/jobs/claim?runner_id={runner_id}", headers=runner_auth,
+    ).json()["job"]
+    assert claimed["id"] == job.json()["job_id"]
+    completed = client.post(
+        f"/api/platform/remote/runner/jobs/{claimed['id']}/complete",
+        headers=runner_auth, json={"output": "Python 3", "exit_code": 0},
+    )
+    assert completed.status_code == 200 and completed.json()["status"] == "completed"
+    assert client.delete(f"/api/platform/notification-endpoints/{endpoint.json()['id']}", headers=auth).status_code == 200
+
+
 def main() -> None:
     results = {}
     with TestClient(app) as client:
@@ -311,6 +439,7 @@ def main() -> None:
             ("external_worker_recovery", external_worker_recovery_scenario),
             ("terminal_websocket", terminal_websocket_scenario),
             ("framework_features", framework_features_scenario),
+            ("platform", platform_scenario),
         ):
             print(f"running integration scenario: {name}", flush=True)
             scenario(client)

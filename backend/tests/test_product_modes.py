@@ -7,15 +7,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from app.core.code import CodeExecutor
-from app.core.rag import LocalRagStore
-from app.core.workspace import WorkspaceEditor
-from app.packages.ai import ModelResponse, OpenAICompatibleProvider, ToolCall
-from app.packages.agent import AgentEvent, ToolResult
-from app.products import ChatbotMode, CodingAgentMode
+from app.extensions.support.execution import CodeExecutor
+from app.extensions.builtin.rag import LocalRagStore
+from app.extensions.builtin.workspace import WorkspaceEditor
+from app.providers import ModelResponse, OpenAICompatibleProvider, ToolCall
+from app.agent_runtime import AgentEvent, ToolResult
+from app.bootstrap import get_container
+from app.products import ChatbotMode, CodingAgentMode, ProductGateway
 from app.products.common import map_agent_event
-from app.products.tool_registry import ProductToolRegistry
-from app.services import ProductGateway
+from app.products.profiles import ProductRuntimeConfig
+from app.extensions.tool_catalog import ProductToolRegistry
 
 
 class FakeProvider:
@@ -68,24 +69,21 @@ def test_coding_agent_exposes_planning_delegation_and_memory_tools(tmp_path):
     provider = FakeProvider()
     rag = LocalRagStore(str(tmp_path / "index.json"))
     registry = ProductToolRegistry(rag, CodeExecutor(timeout=2), WorkspaceEditor(tmp_path))
-    gateway = ProductGateway(
-        chatbot=ChatbotMode(provider=provider, rag=rag, tools=registry),
-        coding_agent=CodingAgentMode(provider=provider, tools=registry),
-    )
+    gateway = _build_gateway(provider, rag, registry)
 
     asyncio.run(_collect(gateway, mode="coding-agent"))
 
-    assert {"update_plan", "delegate_task", "read_project_memory", "remember_project"} <= provider.tool_names
+    assert {
+        "update_plan", "delegate_task", "spawn_agent", "send_agent", "wait_agent",
+        "interrupt_agent", "list_agents", "read_project_memory", "remember_project",
+    } <= provider.tool_names
 
 
 def test_coding_agent_executes_plan_and_bounded_read_only_subagent(tmp_path):
     provider = DelegatingProvider()
     rag = LocalRagStore(str(tmp_path / "index.json"))
     registry = ProductToolRegistry(rag, CodeExecutor(timeout=2), WorkspaceEditor(tmp_path))
-    gateway = ProductGateway(
-        chatbot=ChatbotMode(provider=provider, rag=rag, tools=registry),
-        coding_agent=CodingAgentMode(provider=provider, tools=registry),
-    )
+    gateway = _build_gateway(provider, rag, registry)
 
     events = asyncio.run(_collect(gateway, mode="coding-agent"))
 
@@ -142,9 +140,26 @@ def _gateway(tmp_path: Path) -> ProductGateway:
     provider = FakeProvider()
     rag = LocalRagStore(str(tmp_path / "index.json"))
     tools = ProductToolRegistry(rag, CodeExecutor(timeout=2), WorkspaceEditor(tmp_path))
+    return _build_gateway(provider, rag, tools)
+
+
+def _build_gateway(provider, rag, tools) -> ProductGateway:
+    container = get_container()
+    config = ProductRuntimeConfig(
+        chat_model_id="test", coding_model_id="test", fallback_model_id="test",
+        max_agent_turns=4, context_window=32_768, max_output_tokens=4_096,
+    )
+    services = dict(container.extension_services)
     return ProductGateway(
-        chatbot=ChatbotMode(provider=provider, rag=rag, tools=tools),
-        coding_agent=CodingAgentMode(provider=provider, tools=tools),
+        chatbot=ChatbotMode(
+            provider=provider, rag=rag, tools=tools, extensions=container.extension_registry,
+            runtime_host=container.runtime_host, extension_services=services, config=config,
+        ),
+        coding_agent=CodingAgentMode(
+            provider=provider, tools=tools, extensions=container.extension_registry,
+            runtime_host=container.runtime_host, extension_services=services, config=config,
+            workspace_factory=WorkspaceEditor,
+        ),
     )
 
 

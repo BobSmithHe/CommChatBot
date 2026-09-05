@@ -9,6 +9,10 @@ async function mockApplication(page, options = {}) {
   let refreshCalls = 0;
   const workspaceFiles = options.workspaceFiles || {};
   const memories = [...(options.memories || [])];
+  const automations = [];
+  const notifications = [{ id: "notice-1", title: "任务完成", content: "检查已通过", read: false, created_at: "2026-09-05" }];
+  const notificationEndpoints = [];
+  const githubSubscriptions = [];
   let memorySettings = {
     enabled: true, auto_capture: true, semantic_recall: true,
     user_scope: true, project_scope: true, conversation_scope: true, task_scope: true,
@@ -53,6 +57,31 @@ async function mockApplication(page, options = {}) {
     if (path === "/api/memories/settings" && method === "GET") {
       return route.fulfill({ json: memorySettings });
     }
+    if (path === "/api/platform/automations" && method === "GET") return route.fulfill({ json: automations });
+    if (path === "/api/platform/automations" && method === "POST") {
+      const item = { ...request.postDataJSON(), id: `automation-${nextId++}`, status: "active" };
+      automations.unshift(item);
+      return route.fulfill({ json: item });
+    }
+    if (/^\/api\/platform\/automations\/[^/]+$/.test(path) && method === "DELETE") {
+      automations.splice(automations.findIndex((item) => path.endsWith(item.id)), 1);
+      return route.fulfill({ json: { deleted: true } });
+    }
+    if (path.endsWith("/run") && path.includes("/api/platform/automations/")) return route.fulfill({ json: { queued: true, task_id: "task-scheduled" } });
+    if (path === "/api/platform/notifications" && method === "GET") return route.fulfill({ json: notifications });
+    if (path.endsWith("/read") && path.includes("/api/platform/notifications/")) return route.fulfill({ json: { read: true } });
+    if (path === "/api/platform/notification-deliveries" && method === "GET") return route.fulfill({ json: [] });
+    if (path === "/api/platform/notification-endpoints" && method === "GET") return route.fulfill({ json: notificationEndpoints });
+    if (path === "/api/platform/notification-endpoints" && method === "POST") {
+      const item = { ...request.postDataJSON(), id: `endpoint-${nextId++}`, enabled: true };
+      notificationEndpoints.push(item); return route.fulfill({ json: item });
+    }
+    if (path === "/api/platform/github/subscriptions" && method === "GET") return route.fulfill({ json: githubSubscriptions });
+    if (path === "/api/platform/github/subscriptions" && method === "POST") {
+      const item = { ...request.postDataJSON(), id: `github-${nextId++}`, enabled: true };
+      githubSubscriptions.push(item); return route.fulfill({ json: item });
+    }
+    if (path === "/api/platform/github/reviews" && method === "POST") return route.fulfill({ json: { id: 1, state: "COMMENTED" } });
     if (path === "/api/memories/settings" && method === "PATCH") {
       memorySettings = { ...memorySettings, ...request.postDataJSON() };
       return route.fulfill({ json: memorySettings });
@@ -232,6 +261,24 @@ test("Agent 轨迹按思考、动作和观察配对并渲染 diff", async ({ pag
   await expect(page.getByText("文件已经创建。", { exact: true })).toBeVisible();
 });
 
+test("多 Agent 子任务树在运行轨迹中可见", async ({ page }) => {
+  await mockApplication(page, { chatFrames: [
+    { event: "task", content: { task_id: "a".repeat(32), status: "running" } },
+    { event: "turn_start", content: { index: 0 } },
+    { event: "subagent_started", content: { id: "sub-1", name: "检查测试", focus: "只读复核" } },
+    { event: "subagent_progress", content: { id: "sub-1", event: "tool_start", data: { name: "read_file" } } },
+    { event: "subagent_finished", content: { id: "sub-1", status: "completed", result: "未发现问题" } },
+    { event: "answer", content: "复核完成" },
+    { event: "turn_end", content: { index: 0 } },
+    { event: "done", content: null },
+  ] });
+  await page.goto("/");
+  await page.getByPlaceholder("输入无线通信问题、仿真需求或代码任务...").fill("复核项目");
+  await page.getByRole("button", { name: "发送" }).click();
+  await expect(page.locator(".agent-subagent")).toContainText("检查测试");
+  await expect(page.locator(".agent-subagent")).toContainText("未发现问题");
+});
+
 
 test("Coding 审批固定显示在输入框上方", async ({ page }) => {
   const taskId = "b".repeat(32);
@@ -341,6 +388,23 @@ test("Coding 编辑器支持多文件标签", async ({ page }) => {
   await page.locator(".editor-tab", { hasText: "main.py" }).click();
   await expect(page.locator(".editor-tab.active")).toContainText("main.py");
   await page.getByTitle("格式化文档 (Shift+Alt+F)").click();
+});
+
+test("定时任务与通知可在前端管理", async ({ page }) => {
+  await mockApplication(page);
+  await page.goto("/");
+  await page.getByTitle("定时任务与通知").click();
+  await expect(page.getByRole("region", { name: "定时任务与通知" })).toContainText("任务完成");
+  await page.getByPlaceholder("任务名称").fill("每日检查");
+  await page.getByPlaceholder("每次运行的任务描述").fill("检查测试与 CI");
+  await page.getByLabel("调度类型").selectOption("calendar");
+  await page.getByLabel("时区").fill("Asia/Shanghai");
+  await page.getByRole("region", { name: "定时任务与通知" }).getByRole("button", { name: "创建", exact: true }).click();
+  await expect(page.getByRole("region", { name: "定时任务与通知" })).toContainText("每日检查");
+  await page.getByPlaceholder("名称", { exact: true }).fill("告警");
+  await page.getByPlaceholder("https://…").fill("https://hooks.example.test/notify");
+  await page.getByRole("button", { name: "添加通知目标" }).click();
+  await expect(page.getByText("告警", { exact: true })).toBeVisible();
 });
 
 

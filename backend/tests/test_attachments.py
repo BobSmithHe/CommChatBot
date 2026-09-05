@@ -8,7 +8,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from app.core.attachments import ChatAttachmentStore
+from app.extensions.support.attachments import ChatAttachmentStore
 
 
 def test_chat_attachment_round_trip(tmp_path):

@@ -1,0 +1,132 @@
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass, field
+from typing import Any
+
+from ..providers import LLMMessage, ModelProvider
+
+
+def estimate_tokens(value: Any) -> int:
+    if not isinstance(value, str):
+        value = json.dumps(value, ensure_ascii=False, default=str)
+    cjk = len(re.findall(r"[\u3400-\u9fff\uf900-\ufaff]", value))
+    return max(1, cjk + (max(0, len(value) - cjk) + 3) // 4)
+
+
+def truncate_to_tokens(value: Any, max_tokens: int) -> str:
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    if estimate_tokens(text) <= max_tokens:
+        return text
+    if max_tokens <= 1:
+        return "…"
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if estimate_tokens(text[:middle] + "…") <= max_tokens:
+            low = middle
+        else:
+            high = middle - 1
+    return text[:low].rstrip() + "…"
+
+
+def fit_llm_messages(messages: list[LLMMessage], max_tokens: int) -> list[LLMMessage]:
+    """Keep a possible summary plus the newest contiguous model/tool exchange."""
+    if not messages:
+        return []
+    budget = max(256, max_tokens)
+    if sum(estimate_tokens(item.content) + 8 for item in messages) <= budget:
+        return messages
+    summary = messages[0] if messages[0].role == "system" else None
+    summary_cost = estimate_tokens(summary.content) + 8 if summary else 0
+    if summary and summary_cost > budget // 3:
+        summary = LLMMessage("system", truncate_to_tokens(summary.content, budget // 3))
+        summary_cost = estimate_tokens(summary.content) + 8
+    remaining = budget - summary_cost
+    kept: list[LLMMessage] = []
+    start = 1 if messages[0].role == "system" else 0
+    for item in reversed(messages[start:]):
+        cost = estimate_tokens(item.content) + 8
+        if cost > remaining and not kept:
+            kept.append(LLMMessage(item.role, truncate_to_tokens(item.content, max(64, remaining - 8))))
+            break
+        if cost > remaining:
+            break
+        kept.append(item)
+        remaining -= cost
+    kept.reverse()
+    return ([summary] if summary else []) + kept
+
+
+@dataclass
+class ContextCompactionResult:
+    messages: list[LLMMessage]
+    compacted: bool = False
+    tokens_before: int = 0
+    tokens_after: int = 0
+    summary: str = ""
+    usage: dict[str, Any] = field(default_factory=dict)
+
+
+async def compact_llm_messages(
+    messages: list[LLMMessage], *, provider: ModelProvider, model: str,
+    max_tokens: int, enabled: bool = True, trigger_ratio: float = 0.72,
+) -> ContextCompactionResult:
+    """Structured runtime compaction with a deterministic fallback."""
+    tokens_before = sum(estimate_tokens(item.content) + 8 for item in messages)
+    trigger = int(max_tokens * max(0.5, min(trigger_ratio, 0.95)))
+    if not enabled or tokens_before <= trigger:
+        return ContextCompactionResult(messages, False, tokens_before, tokens_before)
+    keep_budget = max(512, max_tokens // 2)
+    used = 0
+    start = len(messages)
+    for index in range(len(messages) - 1, -1, -1):
+        cost = estimate_tokens(messages[index].content) + 8
+        if used + cost > keep_budget and start < len(messages):
+            break
+        used += cost
+        start = index
+    while start > 0 and messages[start].role == "tool":
+        start -= 1
+    older, recent = messages[:start], messages[start:]
+    if not older:
+        fitted = fit_llm_messages(messages, max_tokens)
+        return ContextCompactionResult(
+            fitted, True, tokens_before,
+            sum(estimate_tokens(item.content) + 8 for item in fitted),
+            "[deterministic truncation]",
+        )
+    serialized = [
+        f"[{item.role}]\n{truncate_to_tokens(item.content, 1_200)}" for item in older
+    ]
+    request = (
+        "Summarize the following earlier agent context. Return concise Markdown with exactly these sections:\n"
+        "## Goal\n## Constraints & Preferences\n## Progress\n## Errors\n## Key Decisions\n"
+        "## Next Steps\n## Read Files\n## Modified Files\n"
+        "Preserve concrete paths, commands, errors, user decisions, pending work, and tool outcomes.\n\n"
+        + "\n\n".join(serialized)
+    )
+    try:
+        response = await provider.complete(
+            [LLMMessage("user", request)], [], model,
+            system="You compact agent history without continuing the task or inventing facts.",
+        )
+        summary = str(response.content or "").strip()
+        if not summary:
+            raise RuntimeError("Compaction model returned an empty summary")
+        compacted = [LLMMessage("system", "Earlier structured context summary:\n" + summary), *recent]
+        if sum(estimate_tokens(item.content) + 8 for item in compacted) > max_tokens:
+            compacted = fit_llm_messages(compacted, max_tokens)
+        return ContextCompactionResult(
+            compacted, True, tokens_before,
+            sum(estimate_tokens(item.content) + 8 for item in compacted),
+            summary, dict(response.metadata.get("usage") or {}),
+        )
+    except Exception:
+        fitted = fit_llm_messages(messages, max_tokens)
+        return ContextCompactionResult(
+            fitted, True, tokens_before,
+            sum(estimate_tokens(item.content) + 8 for item in fitted),
+            "[deterministic fallback]",
+        )

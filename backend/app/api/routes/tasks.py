@@ -5,8 +5,16 @@ import json
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from ...core.runtime_state import runtime_task_manager
-from ...infra.database import AgentTask, ApprovalRequestRecord, ModelUsageRecord, RuntimeEventRecord, User, get_db
+from ...platform.services.task_runtime import runtime_task_manager
+from ...platform.database import (
+    AgentSubtaskRecord,
+    AgentTask,
+    ApprovalRequestRecord,
+    ModelUsageRecord,
+    RuntimeEventRecord,
+    User,
+    get_db,
+)
 from ..deps import current_user
 from ..schemas import ApprovalDecisionRequest, TaskMessageRequest
 
@@ -35,6 +43,23 @@ def _payload(task: AgentTask) -> dict:
     }
 
 
+def _subtask_payload(item: AgentSubtaskRecord) -> dict:
+    return {
+        "id": item.id,
+        "task_id": item.task_id,
+        "parent_id": item.parent_subtask_id,
+        "name": item.name,
+        "focus": item.focus,
+        "status": item.status,
+        "model": item.model,
+        "has_checkpoint": bool(item.checkpoint_json),
+        "result": item.result,
+        "error": item.error,
+        "created_at": item.created_at.isoformat() if item.created_at else None,
+        "updated_at": item.updated_at.isoformat() if item.updated_at else None,
+    }
+
+
 @router.get("")
 def list_tasks(
     conversation_id: int | None = Query(default=None),
@@ -53,6 +78,9 @@ def get_task(task_id: str, user: User = Depends(current_user), db: Session = Dep
     events = db.query(RuntimeEventRecord).filter(RuntimeEventRecord.task_id == task.id).order_by(RuntimeEventRecord.id).all()
     approvals = db.query(ApprovalRequestRecord).filter(ApprovalRequestRecord.task_id == task.id).order_by(ApprovalRequestRecord.created_at).all()
     usage_rows = db.query(ModelUsageRecord).filter(ModelUsageRecord.task_id == task.id).all()
+    subtasks = db.query(AgentSubtaskRecord).filter(
+        AgentSubtaskRecord.task_id == task.id
+    ).order_by(AgentSubtaskRecord.created_at).all()
     return {
         **_payload(task),
         "events": [
@@ -80,7 +108,58 @@ def get_task(task_id: str, user: User = Depends(current_user), db: Session = Dep
             "cache_write_tokens": sum(item.cache_write_tokens for item in usage_rows),
             "cost_usd": round(sum(item.cost_usd for item in usage_rows), 8),
         },
+        "subtasks": [_subtask_payload(item) for item in subtasks],
     }
+
+
+@router.get("/{task_id}/subtasks")
+def list_subtasks(
+    task_id: str,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    _require_task(db, user.id, task_id)
+    rows = db.query(AgentSubtaskRecord).filter(
+        AgentSubtaskRecord.task_id == task_id
+    ).order_by(AgentSubtaskRecord.created_at).all()
+    return [_subtask_payload(item) for item in rows]
+
+
+@router.get("/{task_id}/subtasks/{subtask_id}")
+def get_subtask(
+    task_id: str, subtask_id: str,
+    user: User = Depends(current_user), db: Session = Depends(get_db),
+) -> dict:
+    _require_task(db, user.id, task_id)
+    item = db.query(AgentSubtaskRecord).filter(
+        AgentSubtaskRecord.task_id == task_id, AgentSubtaskRecord.id == subtask_id,
+    ).first()
+    if not item:
+        raise HTTPException(status_code=404, detail="Sub-agent not found")
+    return _subtask_payload(item)
+
+
+@router.post("/{task_id}/subtasks/{subtask_id}/messages")
+def enqueue_subtask_message(
+    task_id: str, subtask_id: str, req: TaskMessageRequest,
+    user: User = Depends(current_user), db: Session = Depends(get_db),
+) -> dict:
+    _require_task(db, user.id, task_id)
+    queued = runtime_task_manager.enqueue_subtask_message(task_id, subtask_id, req.kind, req.content)
+    if not queued:
+        raise HTTPException(status_code=409, detail="Sub-agent is not accepting messages")
+    return {"status": "queued", "agent_id": subtask_id, **queued}
+
+
+@router.post("/{task_id}/subtasks/{subtask_id}/interrupt")
+def interrupt_subtask(
+    task_id: str, subtask_id: str,
+    user: User = Depends(current_user), db: Session = Depends(get_db),
+) -> dict:
+    _require_task(db, user.id, task_id)
+    if not runtime_task_manager.cancel_subtask(task_id, subtask_id):
+        raise HTTPException(status_code=404, detail="Sub-agent not found")
+    return {"id": subtask_id, "status": "cancelled"}
 
 
 @router.post("/{task_id}/messages")

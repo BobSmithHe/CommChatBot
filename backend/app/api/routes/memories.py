@@ -5,8 +5,8 @@ from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from ...core.memory import MEMORY_SCOPES, MemoryTarget, memory_service
-from ...infra.database import AgentTask, Conversation, User, get_db
+from ...extensions.builtin.memory import MEMORY_SCOPES, MemoryTarget, memory_service
+from ...platform.database import AgentTask, Conversation, User, get_db
 from ..conversation_utils import ensure_conversation_workspace
 from ..deps import current_user
 from ..schemas import MemoryCreateRequest, MemorySettingsRequest, MemoryUpdateRequest

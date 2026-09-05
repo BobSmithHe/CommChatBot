@@ -3,9 +3,9 @@ from __future__ import annotations
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from app.core.context import ConversationContextManager, estimate_tokens, fit_llm_messages
-from app.infra.database import Base, Conversation, Message
-from app.packages.ai import LLMMessage
+from app.platform.services.context import ConversationContextManager, estimate_tokens, fit_llm_messages
+from app.platform.database import Base, Conversation, Message
+from app.providers import LLMMessage
 
 
 def test_fit_llm_messages_respects_budget_and_keeps_latest() -> None:

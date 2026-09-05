@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..packages.agent import AgentMessage
+from ..agent_runtime import AgentMessage
 
 
 def history_to_agent_messages(history: list[dict]) -> list[AgentMessage]:

@@ -5,12 +5,18 @@ import json
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from ..core.workspace import ConversationWorkspaceManager, WorkspaceEditor
-from ..core.context import context_manager
-from ..infra.database import Conversation, Message
+from ..bootstrap import get_container
+from ..platform.database import Conversation, Message
+from ..platform.services.conversations import (
+    ConversationModeConflict,
+    ConversationNotFound,
+    WorkspaceUnavailable,
+)
+from ..platform.ports import WorkspaceHandle
 
 
-workspace_manager = ConversationWorkspaceManager()
+# Compatibility alias backed by the single bootstrap-owned instance.
+workspace_manager = get_container().workspace_manager
 
 
 def get_or_create_conversation(
@@ -19,42 +25,30 @@ def get_or_create_conversation(
     conversation_id: int | None,
     mode: str,
 ) -> Conversation:
-    if conversation_id is not None:
-        conv = db.query(Conversation).filter(Conversation.id == conversation_id, Conversation.user_id == user_id).first()
-        if not conv:
-            raise HTTPException(status_code=404, detail="Conversation not found")
-        if conv.mode != mode:
-            raise HTTPException(status_code=409, detail="Conversation belongs to a different mode")
-        if conv.mode == "coding-agent":
-            ensure_conversation_workspace(db, conv)
-        return conv
-    workspace_id = workspace_manager.create() if mode == "coding-agent" else None
-    conv = Conversation(user_id=user_id, mode=mode, workspace_id=workspace_id, title="New Conversation")
-    db.add(conv)
-    db.commit()
-    db.refresh(conv)
-    return conv
+    try:
+        return get_container().conversations.get_or_create(db, user_id, conversation_id, mode)
+    except ConversationNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ConversationModeConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 def require_conversation(db: Session, user_id: int, conversation_id: int) -> Conversation:
-    conv = db.query(Conversation).filter(Conversation.id == conversation_id, Conversation.user_id == user_id).first()
-    if not conv:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    return conv
+    try:
+        return get_container().conversations.require(db, user_id, conversation_id)
+    except ConversationNotFound as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
-def ensure_conversation_workspace(db: Session, conv: Conversation) -> WorkspaceEditor:
-    if conv.mode != "coding-agent":
-        raise HTTPException(status_code=400, detail="Workspace is only available in Coding Agent mode")
-    if not conv.workspace_id:
-        conv.workspace_id = workspace_manager.create()
-        db.commit()
-        db.refresh(conv)
-    return workspace_manager.editor(conv.workspace_id)
+def ensure_conversation_workspace(db: Session, conv: Conversation) -> WorkspaceHandle:
+    try:
+        return get_container().conversations.ensure_workspace(db, conv)
+    except WorkspaceUnavailable as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def conversation_history(db: Session, conversation_id: int) -> list[dict]:
-    return context_manager.prepare(db, conversation_id)
+    return get_container().conversations.history(db, conversation_id)
 
 
 def conversation_payload(conv: Conversation, message_count: int) -> dict:

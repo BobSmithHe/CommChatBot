@@ -3,9 +3,12 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 
-from app.core.rag import LocalRagStore, route_rag_query
-from app.packages.ai import ModelResponse
+from app.extensions.builtin.rag import LocalRagStore, route_rag_query
+from app.providers import ModelResponse
 from app.products import ChatbotMode
+from app.products.profiles import ProductRuntimeConfig
+from app.bootstrap import get_container
+from app.agent_runtime import NullRuntimeHost
 
 
 class FakeProvider:
@@ -69,11 +72,7 @@ def test_intent_router_keeps_real_questions_and_rewrites_followups() -> None:
 
 def test_chatbot_does_not_search_rag_for_greeting() -> None:
     rag = SpyRag()
-    chatbot = ChatbotMode(
-        provider=FakeProvider(),
-        rag=rag,
-        tools=SimpleNamespace(search_web=None),
-    )
+    chatbot = _chatbot(rag)
 
     async def collect():
         return [event async for event in chatbot.stream_rag(
@@ -89,17 +88,11 @@ def test_chatbot_does_not_search_rag_for_greeting() -> None:
 
 
 def test_chatbot_rag_timeout_falls_back_to_model_answer() -> None:
-    chatbot = ChatbotMode(
-        provider=FakeProvider(),
-        rag=SlowRag(),
-        tools=SimpleNamespace(search_web=None),
-    )
-    chatbot.settings = SimpleNamespace(
+    settings = SimpleNamespace(
         rag_intent_routing=True,
         rag_search_timeout_seconds=0.01,
-        chat_model_id="",
-        deepseek_model="fake-model",
     )
+    chatbot = _chatbot(SlowRag(), settings=settings)
 
     async def collect():
         return [event async for event in chatbot.stream_rag(
@@ -124,3 +117,17 @@ def test_low_similarity_milvus_result_is_rejected_and_score_is_preserved(tmp_pat
     results = asyncio.run(store.search("OFDM 是什么", top_k=5))
     assert len(results) == 1
     assert results[0].score == 0.81
+
+
+def _chatbot(rag, *, settings=None) -> ChatbotMode:
+    settings = settings or SimpleNamespace(rag_intent_routing=True, rag_search_timeout_seconds=12.0)
+    container = get_container()
+    services = {**container.extension_services, "settings": settings}
+    return ChatbotMode(
+        provider=FakeProvider(), rag=rag, tools=SimpleNamespace(search_web=None),
+        extensions=container.extension_registry, runtime_host=NullRuntimeHost(),
+        extension_services=services,
+        config=ProductRuntimeConfig(
+            chat_model_id="fake-model", coding_model_id="fake-model", fallback_model_id="fake-model",
+        ),
+    )

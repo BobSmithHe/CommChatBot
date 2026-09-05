@@ -11,18 +11,18 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from app.core.code import CodeExecutor
-from app.core.rag import LocalRagStore
-from app.core.workspace import ConversationWorkspaceManager, WorkspaceEditor
-from app.core.workspace.terminal import (
+from app.extensions.support.execution import CodeExecutor
+from app.extensions.builtin.rag import LocalRagStore
+from app.extensions.builtin.workspace import ConversationWorkspaceManager, WorkspaceEditor
+from app.extensions.builtin.terminal.session import (
     WorkspaceTerminalManager,
     WorkspaceTerminalSession,
     cleanup_orphaned_terminal_containers,
 )
-from app.core.workspace.terminal import MAX_OUTPUT_CHARS
+from app.extensions.builtin.terminal.session import MAX_OUTPUT_CHARS
 from app.infra.config import get_settings
-from app.core.runtime_state import RuntimeTaskManager
-from app.products.tool_registry import ProductToolRegistry
+from app.platform.services.task_runtime import RuntimeTaskManager
+from app.extensions.tool_catalog import ProductToolRegistry
 
 
 def test_chat_and_coding_tools_are_isolated(tmp_path):
@@ -280,17 +280,17 @@ def test_orphan_terminal_cleanup_only_removes_owned_names(monkeypatch):
     removed = []
 
     monkeypatch.setattr(
-        "app.core.workspace.terminal.get_settings",
+        "app.extensions.builtin.terminal.session.get_settings",
         lambda: type("Settings", (), {"sandbox_mode": "docker"})(),
     )
-    monkeypatch.setattr("app.core.workspace.terminal.shutil.which", lambda _name: "docker")
+    monkeypatch.setattr("app.extensions.builtin.terminal.session.shutil.which", lambda _name: "docker")
     monkeypatch.setattr(
-        "app.core.workspace.terminal.subprocess.run",
+        "app.extensions.builtin.terminal.session.subprocess.run",
         lambda *_args, **_kwargs: type("Result", (), {
             "stdout": "commchat-terminal-0123456789abcdef\nunrelated-container\ncommchat-terminal-nothex\n",
         })(),
     )
-    monkeypatch.setattr("app.core.workspace.terminal.remove_docker_container", removed.append)
+    monkeypatch.setattr("app.extensions.builtin.terminal.session.remove_docker_container", removed.append)
 
     assert cleanup_orphaned_terminal_containers() == ["commchat-terminal-0123456789abcdef"]
     assert removed == ["commchat-terminal-0123456789abcdef"]

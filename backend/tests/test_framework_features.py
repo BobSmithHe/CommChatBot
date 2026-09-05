@@ -3,12 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 
-from app.core.context import compact_llm_messages
-from app.core.project_context import ProjectContextLoader
-from app.core.workspace.editor import WorkspaceEditor
-from app.packages.agent import AgentRuntime, AgentSessionConfig, Tool, create_agent_session
-from app.packages.agent.tools import ToolExecutor
-from app.packages.ai import LLMMessage, ModelResponse, ProviderRegistry, ToolCall
+from app.agent_runtime.context import compact_llm_messages
+from app.extensions.builtin.project_context import ProjectContextLoader
+from app.extensions.builtin.workspace.editor import WorkspaceEditor
+from app.agent_runtime import AgentRuntime, AgentSessionConfig, NullRuntimeHost, Tool, create_agent_session
+from app.agent_runtime.tools import ToolExecutor
+from app.providers import LLMMessage, ModelResponse, ProviderRegistry, ToolCall
 
 
 def test_tool_executor_validates_complete_json_schema() -> None:
@@ -84,9 +84,8 @@ def test_follow_up_extends_runtime_at_turn_boundary(monkeypatch) -> None:
             return [{"id": 1, "kind": "follow_up", "content": "continue"}]
         return []
 
-    monkeypatch.setattr("app.packages.agent.runtime.runtime_task_manager.consume_messages", consume)
-    monkeypatch.setattr("app.packages.agent.runtime.runtime_task_manager.save_checkpoint", lambda *_args: None)
-    monkeypatch.setattr("app.packages.agent.runtime.runtime_task_manager.record_usage", lambda *_args: None)
+    host = NullRuntimeHost()
+    monkeypatch.setattr(host, "consume_messages", consume)
     runtime = AgentRuntime(
         provider=provider,
         model="test",
@@ -94,6 +93,7 @@ def test_follow_up_extends_runtime_at_turn_boundary(monkeypatch) -> None:
         system_prompt="test",
         max_turns=1,
         task_id="a" * 32,
+        host=host,
     )
 
     async def collect():
@@ -146,8 +146,12 @@ def test_trusted_project_context_discovers_skills_and_extensions(tmp_path) -> No
     assert "AGENTS.md" in untrusted.discovered
     assert untrusted.text == ""
     assert "Use pytest." in trusted.text
-    assert "Review changed files." in trusted.text
-    assert [tool.name for tool in trusted.tools] == ["project_status"]
+    assert "review: Review changed files." in trusted.text
+    assert "Review changed files." not in trusted.text.split("Available project Skills", 1)[0]
+    assert [tool.name for tool in trusted.tools] == [
+        "project_status", "list_skills", "read_skill", "list_skill_resources",
+        "read_skill_resource", "run_skill_script",
+    ]
 
 
 def test_provider_catalog_and_programmatic_sdk() -> None:

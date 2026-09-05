@@ -5,7 +5,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
 from ..infra.config import get_settings
-from ..infra.database import User, ensure_anonymous_user, get_db
+from ..platform.database import User, ensure_anonymous_user, get_db
 from ..infra.security import decode_access_token
 
 security = HTTPBearer(auto_error=False)

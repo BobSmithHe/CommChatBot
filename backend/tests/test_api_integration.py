@@ -32,6 +32,9 @@ def integration_results(tmp_path_factory) -> dict:
         "DB_PORT": "1",
         "OBSERVABILITY_ENABLED": "false",
         "MEMORY_SEMANTIC_RECALL": "false",
+        "REMOTE_RUNNER_TOKEN": "integration-runner-secret",
+        "GITHUB_WEBHOOK_SECRET": "integration-webhook-secret",
+        "SANDBOX_MODE": "local",
     })
     completed = subprocess.run(
         [sys.executable, str(Path(__file__).with_name("integration_scenarios.py"))],
@@ -71,3 +74,7 @@ def test_conpty_websocket_input_and_resize(integration_results: dict) -> None:
 
 def test_persistent_mailbox_conversation_branches_and_model_catalog(integration_results: dict) -> None:
     assert integration_results["framework_features"] == "passed"
+
+
+def test_automations_notifications_and_remote_runner_protocol(integration_results: dict) -> None:
+    assert integration_results["platform"] == "passed"

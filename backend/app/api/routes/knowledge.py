@@ -4,9 +4,9 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 
-from ...core.documents import extract_text
+from ...extensions.support.documents import extract_text
 from ...infra.config import get_settings
-from ...infra.database import User
+from ...platform.database import User
 from ...services import get_rag_store
 from ..deps import current_user
 

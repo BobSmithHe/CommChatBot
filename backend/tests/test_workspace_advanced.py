@@ -4,9 +4,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.core.workspace.editor import WorkspaceEditor
-from app.core.workspace.manager import ConversationWorkspaceManager
-from app.core.workspace.memory import ProjectMemoryStore
+from app.extensions.builtin.workspace.editor import WorkspaceEditor
+from app.extensions.builtin.workspace.manager import ConversationWorkspaceManager
+from app.extensions.builtin.memory.project_store import ProjectMemoryStore
 
 
 def test_workspace_walk_prunes_dependencies_and_versions_detect_external_changes(tmp_path) -> None:
@@ -40,7 +40,7 @@ def test_local_project_import_copies_source_but_excludes_secrets_and_dependencie
         workspace_import_roots=str(tmp_path / "projects"),
         git_clone_timeout_seconds=30,
     )
-    monkeypatch.setattr("app.core.workspace.manager.get_settings", lambda: settings)
+    monkeypatch.setattr("app.extensions.builtin.workspace.manager.get_settings", lambda: settings)
     manager = ConversationWorkspaceManager(managed)
 
     workspace_id = manager.import_workspace(str(source), "local", "main")
@@ -58,7 +58,7 @@ def test_project_memory_is_shared_across_conversations_for_same_import(tmp_path,
         workspace_import_roots=str(tmp_path / "projects"),
         git_clone_timeout_seconds=30,
     )
-    monkeypatch.setattr("app.core.workspace.manager.get_settings", lambda: settings)
+    monkeypatch.setattr("app.extensions.builtin.workspace.manager.get_settings", lambda: settings)
     manager = ConversationWorkspaceManager(tmp_path / "managed")
     first = manager.editor(manager.import_workspace(str(source), "local", "main"))
     second = manager.editor(manager.import_workspace(str(source), "local", "main"))
@@ -75,7 +75,7 @@ def test_local_import_rejects_source_outside_allowlist(tmp_path, monkeypatch) ->
     allowed = tmp_path / "allowed"
     allowed.mkdir()
     settings = SimpleNamespace(workspace_import_roots=str(allowed), git_clone_timeout_seconds=30)
-    monkeypatch.setattr("app.core.workspace.manager.get_settings", lambda: settings)
+    monkeypatch.setattr("app.extensions.builtin.workspace.manager.get_settings", lambda: settings)
     manager = ConversationWorkspaceManager(tmp_path / "managed")
     with pytest.raises(ValueError, match="outside WORKSPACE_IMPORT_ROOTS"):
         manager.import_workspace(str(source), "local", "main")

@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
-from app.core import sandbox
+from app.extensions.support import sandbox
 
 
 def test_docker_runner_isolated_and_does_not_forward_secrets(tmp_path, monkeypatch) -> None:

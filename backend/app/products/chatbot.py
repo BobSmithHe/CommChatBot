@@ -1,25 +1,29 @@
 from __future__ import annotations
 
-import asyncio
-from typing import AsyncIterator
+from typing import AsyncIterator, Mapping, Any
 
-from ..core.rag import LocalRagStore, RetrievedChunk, route_rag_query
-from ..core.memory import memory_service
-from ..infra.config import get_settings
-from ..packages.agent import AgentRuntime
-from ..packages.ai import ModelProvider
+from ..agent_runtime import AgentRuntime, AgentRuntimeHost, ExtensionContext, ExtensionRegistry
+from ..providers import ModelProvider
 from .common import history_to_agent_messages, map_agent_event
-from .tool_registry import ProductToolRegistry
+from .ports import RetrievalPort, RetrievedDocument, ToolCatalogPort
+from .profiles import CHAT_PROFILE, ProductRuntimeConfig, apply_profile_overrides
 
 
 class ChatbotMode:
     """Chat product shell with deterministic optional RAG and web context."""
 
-    def __init__(self, *, provider: ModelProvider, rag: LocalRagStore, tools: ProductToolRegistry) -> None:
+    def __init__(
+        self, *, provider: ModelProvider, rag: RetrievalPort, tools: ToolCatalogPort,
+        extensions: ExtensionRegistry, runtime_host: AgentRuntimeHost,
+        extension_services: Mapping[str, Any], config: ProductRuntimeConfig,
+    ) -> None:
         self.provider = provider
         self.rag = rag
         self.tools = tools
-        self.settings = get_settings()
+        self.config = config
+        self.extensions = extensions
+        self.runtime_host = runtime_host
+        self.extension_services = dict(extension_services)
 
     async def stream_rag(
         self,
@@ -34,97 +38,59 @@ class ChatbotMode:
         conversation_id: int | None = None,
         resume_state: dict | None = None,
     ) -> AsyncIterator[dict]:
-        docs: list[RetrievedChunk] = []
-        if use_rag and not resume_state:
-            decision = route_rag_query(message or "", history) if self.settings.rag_intent_routing else None
-            if decision is None or decision.should_retrieve:
-                retrieval_query = decision.query if decision else (message or "")
-                yield {"event": "status", "content": f"Searching local knowledge: {retrieval_query}"}
-                try:
-                    docs = await asyncio.wait_for(
-                        self.rag.search(retrieval_query, top_k=5),
-                        timeout=max(0.1, float(self.settings.rag_search_timeout_seconds)),
-                    )
-                except asyncio.TimeoutError:
-                    yield {
-                        "event": "status",
-                        "content": "Local knowledge search timed out; continuing without RAG.",
-                    }
-                    docs = []
-                except Exception as exc:
-                    yield {
-                        "event": "status",
-                        "content": f"Local knowledge search unavailable ({type(exc).__name__}); continuing without RAG.",
-                    }
-                    docs = []
-                yield {"event": "result", "content": self._summarize_docs(docs) if docs else "No sufficiently relevant local knowledge matched."}
-                if docs:
-                    yield {
-                        "event": "sources",
-                        "content": [
-                            {"source": doc.source, "title": doc.title, "chunk_id": doc.chunk_id, "score": doc.score}
-                            for doc in docs
-                        ],
-                    }
-            else:
-                yield {"event": "status", "content": f"Skipped local knowledge: {decision.reason}"}
-
-        web_context = ""
-        if use_web and not resume_state:
-            yield {"event": "status", "content": f"Searching the web: {message or ''}"}
-            web_context = await self.tools.search_web(message or "")
-            yield {"event": "result", "content": web_context[:1200]}
+        profile = apply_profile_overrides(CHAT_PROFILE, self.config.chat_extensions)
+        activated = await self.extensions.activate(profile, ExtensionContext(
+            mode="chatbot",
+            services={
+                **self.extension_services,
+                "rag": self.rag, "tool_registry": self.tools,
+            },
+            request={
+                "message": message, "history": history, "use_rag": use_rag, "use_web": use_web,
+                "task_id": task_id, "user_id": user_id, "conversation_id": conversation_id,
+                "resume_state": resume_state,
+            },
+        ))
+        for extension_event in activated.events:
+            yield extension_event
+        docs: list[RetrievedDocument] = activated.values.get("rag_docs", [])
+        web_context = str(activated.values.get("web_context") or "")
 
         prompt = None if resume_state is not None and message is None else self._rag_prompt(message or "", docs, web_context)
-        memory_context = ""
-        if user_id is not None:
-            recall_query = message or next(
-                (str(item.get("content") or "") for item in reversed(history) if item.get("role") == "user"),
-                "",
-            )
-            memories = await asyncio.to_thread(
-                memory_service.recall,
-                user_id=user_id,
-                query=recall_query,
-                conversation_id=conversation_id,
-                task_id=task_id,
-            )
-            memory_context = memory_service.format_for_prompt(memories)
-            if memories:
-                yield {
-                    "event": "memory_recalled",
-                    "content": {
-                        "count": len(memories),
-                        "memories": [
-                            {"id": item["id"], "scope": item["scope"], "key": item["key"]}
-                            for item in memories
-                        ],
-                    },
-                }
+        memory_context = str(activated.values.get("memory_context") or "")
         runtime_system = system_context or self._rag_system_prompt()
         if memory_context:
             runtime_system += "\n\n" + memory_context
         runtime = AgentRuntime(
             provider=self.provider,
-            model=self.settings.chat_model_id or getattr(self.provider, "default_model", "") or self.settings.deepseek_model,
+            model=self.config.chat_model_id or getattr(self.provider, "default_model", "") or self.config.fallback_model_id,
             tools=[],
             system_prompt=runtime_system,
             max_turns=1,
             task_id=task_id,
             permission_mode="read-only",
+            hook_handlers=activated.hooks,
+            host=self.runtime_host,
+            context_window=self.config.context_window,
+            max_output_tokens=self.config.max_output_tokens,
+            context_compaction=self.config.context_compaction,
+            context_compaction_trigger_ratio=self.config.context_compaction_trigger_ratio,
         )
         yield {"event": "status", "content": "Generating answer"}
-        async for event in runtime.run(
-            prompt,
-            history_to_agent_messages(history),
-            resume_state=resume_state,
-        ):
-            mapped = map_agent_event(event)
-            if mapped:
-                yield mapped
+        try:
+            async for event in runtime.run(
+                prompt,
+                history_to_agent_messages(history),
+                resume_state=resume_state,
+            ):
+                mapped = map_agent_event(event)
+                if mapped:
+                    yield mapped
+        finally:
+            await activated.close()
 
     @staticmethod
-    def _rag_prompt(message: str, docs: list[RetrievedChunk], web_context: str) -> str:
+    def _rag_prompt(message: str, docs: list[RetrievedDocument], web_context: str) -> str:
         if not docs and not web_context:
             return message
         sections = []
@@ -136,10 +102,6 @@ class ChatbotMode:
             sections.append("Web search:\n" + web_context[:5000])
         context = "\n\n".join(sections)
         return f"Question:\n{message}\n\nRetrieved context:\n{context}\n\nAnswer using the context when relevant."
-
-    @staticmethod
-    def _summarize_docs(docs: list[RetrievedChunk]) -> str:
-        return "Found " + str(len(docs)) + " chunks: " + " | ".join(f"{doc.source} ({doc.score})" for doc in docs)
 
     @staticmethod
     def _rag_system_prompt() -> str:

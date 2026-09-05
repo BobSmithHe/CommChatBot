@@ -7,8 +7,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from app.core.code import CodeExecutor
-from app.core.rag import LocalRagStore
+from app.extensions.support.execution import CodeExecutor
+from app.extensions.builtin.rag import LocalRagStore
 from app.main import app
 from app.infra.security import create_access_token, decode_access_token
 

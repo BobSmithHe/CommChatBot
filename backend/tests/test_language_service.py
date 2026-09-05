@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.core.workspace.language import WorkspaceLanguageService
+from app.extensions.builtin.workspace.language import WorkspaceLanguageService
 
 
 def test_python_language_service_completion_diagnostics_format_and_definition(tmp_path) -> None:

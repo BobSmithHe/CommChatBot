@@ -11,10 +11,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from app.packages.agent import AgentRuntime, Tool
-from app.packages.agent.tools import ToolExecutor
-from app.packages.ai import ModelResponse, ModelStreamEvent, ToolCall
-from app.core.hooks import hook_runner
+from app.agent_runtime import AgentRuntime, NullRuntimeHost, Tool
+from app.agent_runtime.tools import ToolExecutor
+from app.providers import ModelResponse, ModelStreamEvent, ToolCall
 
 
 class FakeProvider:
@@ -407,14 +406,13 @@ def test_approval_rejection_is_returned_to_model(monkeypatch):
         executed.append(query)
         return query
 
-    monkeypatch.setattr("app.packages.agent.runtime.runtime_task_manager.ensure_not_cancelled", lambda _task_id: None)
-    monkeypatch.setattr("app.packages.agent.runtime.runtime_task_manager.save_checkpoint", lambda *_args: None)
-    monkeypatch.setattr("app.packages.agent.runtime.runtime_task_manager.create_approval", lambda *_args: "approval-1")
+    host = NullRuntimeHost()
+    monkeypatch.setattr(host, "create_approval", lambda *_args: "approval-1")
 
     async def reject(_approval_id):
         return False
 
-    monkeypatch.setattr("app.packages.agent.runtime.runtime_task_manager.wait_for_approval", reject)
+    monkeypatch.setattr(host, "wait_for_approval", reject)
     runtime = AgentRuntime(
         provider=provider,
         model="test-model",
@@ -425,6 +423,7 @@ def test_approval_rejection_is_returned_to_model(monkeypatch):
         system_prompt="test",
         max_turns=2,
         task_id="task-approval",
+        host=host,
     )
     events = asyncio.run(_collect_events(runtime, "approve"))
     rejected = next(event.data["result"] for event in events if event.type == "tool_end")
@@ -445,12 +444,12 @@ def test_task_cancellation_has_cancelled_stop_without_error(monkeypatch):
         nonlocal checks
         checks += 1
         if checks >= 2:
-            from app.core.runtime_state import TaskCancelled
+            from app.agent_runtime import TaskCancelled
             raise TaskCancelled("cancelled")
 
-    monkeypatch.setattr(hook_runner, "run", record)
-    monkeypatch.setattr("app.packages.agent.runtime.runtime_task_manager.ensure_not_cancelled", cancel_on_stream)
-    monkeypatch.setattr("app.packages.agent.runtime.runtime_task_manager.save_checkpoint", lambda *_args: None)
+    host = NullRuntimeHost()
+    monkeypatch.setattr(host, "run_hooks", record)
+    monkeypatch.setattr(host, "ensure_not_cancelled", cancel_on_stream)
     runtime = AgentRuntime(
         provider=FakeStreamProvider(),
         model="test-model",
@@ -458,6 +457,7 @@ def test_task_cancellation_has_cancelled_stop_without_error(monkeypatch):
         system_prompt="test",
         max_turns=1,
         task_id="task-cancel",
+        host=host,
     )
 
     with pytest.raises(Exception, match="cancelled") as caught:
@@ -496,8 +496,8 @@ def test_checkpoint_before_tool_prevents_automatic_replay(monkeypatch):
         executions.append("written")
         raise FatalToolCrash("process died")
 
-    monkeypatch.setattr("app.packages.agent.runtime.runtime_task_manager.ensure_not_cancelled", lambda _task_id: None)
-    monkeypatch.setattr("app.packages.agent.runtime.runtime_task_manager.save_checkpoint", save)
+    host = NullRuntimeHost()
+    monkeypatch.setattr(host, "save_checkpoint", save)
     first = AgentRuntime(
         provider=CheckpointProvider(tool_first=True),
         model="test-model",
@@ -506,6 +506,7 @@ def test_checkpoint_before_tool_prevents_automatic_replay(monkeypatch):
         max_turns=3,
         task_id="checkpoint-task",
         permission_mode="full-access",
+        host=host,
     )
     with pytest.raises(FatalToolCrash):
         asyncio.run(_collect_events(first, "write once"))
@@ -524,6 +525,7 @@ def test_checkpoint_before_tool_prevents_automatic_replay(monkeypatch):
         max_turns=3,
         task_id="checkpoint-task",
         permission_mode="full-access",
+        host=host,
     )
     events = asyncio.run(_collect_events(resumed, None, resume_state=checkpoint))
     recovered_result = next(
@@ -547,13 +549,15 @@ def test_hooks_cover_session_and_normal_stop(monkeypatch):
         seen.append((event, payload.get("reason")))
         return [{"allow": True, "event": event}]
 
-    monkeypatch.setattr(hook_runner, "run", record)
+    host = NullRuntimeHost()
+    monkeypatch.setattr(host, "run_hooks", record)
     runtime = AgentRuntime(
         provider=FakeStreamProvider(),
         model="test-model",
         tools=[],
         system_prompt="test",
         max_turns=1,
+        host=host,
     )
     events = asyncio.run(_collect(runtime))
     assert ("SessionStart", "startup") in seen

@@ -62,6 +62,8 @@ class Settings(BaseSettings):
     max_agent_turns: int = 8
     approval_timeout_seconds: int = 300
     hooks_config_path: str = ""
+    chat_extensions: str = ""
+    coding_extensions: str = ""
 
     tavily_api_key: str = ""
     jwt_secret_key: str = "change-me"
@@ -104,6 +106,29 @@ class Settings(BaseSettings):
     agent_worker_concurrency: int = 8
     task_queue_name: str = "commchatbot:agent:queue"
     task_event_poll_ms: int = 120
+    runtime_event_batch_size: int = 50
+    runtime_event_flush_ms: int = 100
+    runtime_event_stream_maxlen: int = 5000
+    memory_job_queue_name: str = "commchatbot:memory:queue"
+    memory_worker_concurrency: int = 2
+
+    github_token: str = ""
+    github_default_base: str = "main"
+    github_webhook_secret: str = ""
+    mcp_config_path: str = ""
+    mcp_idle_timeout_seconds: int = 300
+    automation_poll_seconds: float = 2.0
+    notification_poll_seconds: float = 2.0
+    notification_max_attempts: int = 6
+    notification_allow_http: bool = False
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    smtp_from: str = ""
+    smtp_starttls: bool = True
+    remote_runner_token: str = ""
+    remote_require_isolation: bool = True
 
     sandbox_mode: str = "local"
     sandbox_image: str = "commchatbot-sandbox:0.8.0"

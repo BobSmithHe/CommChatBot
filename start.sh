@@ -58,9 +58,12 @@ discover_existing_pid() {
 
 process_alive() {
   local pid="${1:-}"
-  [[ -n "$pid" ]] || return 1
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
   if is_windows_bash; then
-    tasklist //FI "PID eq $pid" //NH 2>/dev/null | grep -qE "[[:space:]]$pid[[:space:]]"
+    if tasklist //FI "PID eq $pid" //NH 2>/dev/null | grep -qE "[[:space:]]$pid[[:space:]]"; then
+      return 0
+    fi
+    powershell.exe -NoProfile -Command "if (Get-Process -Id $pid -ErrorAction SilentlyContinue) { exit 0 } else { exit 1 }" >/dev/null 2>&1
   else
     kill -0 "$pid" 2>/dev/null
   fi
@@ -98,9 +101,17 @@ start_process() {
     nohup "$@" >> "$log_file" 2>&1 &
     echo "$!" > "$(pid_file "$name")"
   )
-  sleep 1
   local new_pid
   new_pid="$(read_pid "$name" || true)"
+  for _ in {1..20}; do
+    process_alive "$new_pid" && break
+    # On Windows, conda/npm launchers can exit after spawning the actual
+    # service process, so $! is only a short-lived wrapper PID. Startup may
+    # also spend a few seconds applying database migrations.
+    new_pid="$(discover_existing_pid "$name" || true)"
+    process_alive "$new_pid" && break
+    sleep 0.5
+  done
   if ! process_alive "$new_pid"; then
     echo "$name 启动失败，请查看 $log_file" >&2
     tail -n 30 "$log_file" 2>/dev/null || true
@@ -113,9 +124,12 @@ stop_process() {
   local name="$1" pid
   pid="$(read_pid "$name" || true)"
   if ! process_alive "$pid"; then
-    rm -f "$(pid_file "$name")"
-    echo "$name 未运行"
-    return
+    pid="$(discover_existing_pid "$name" || true)"
+    if ! process_alive "$pid"; then
+      rm -f "$(pid_file "$name")"
+      echo "$name 未运行"
+      return
+    fi
   fi
   if is_windows_bash; then
     taskkill //PID "$pid" //T //F >/dev/null 2>&1 || true

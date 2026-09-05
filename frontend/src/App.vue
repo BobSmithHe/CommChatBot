@@ -39,6 +39,7 @@
           <span>{{ currentUser?.username || "未登录" }}</span>
         </div>
         <div class="account-actions">
+          <button type="button" title="定时任务与通知" @click="openOperations"><Bell :size="14" /></button>
           <button type="button" title="记忆管理" @click="openMemoryPanel"><Brain :size="14" /></button>
           <button v-if="currentUser?.username !== 'anonymous'" type="button" title="退出登录" @click="logout">
             <LogOut :size="14" />
@@ -375,6 +376,64 @@
     </section>
   </div>
 
+  <div v-if="operationsOpen" class="auth-overlay memory-overlay" @click.self="operationsOpen = false">
+    <section class="memory-dialog operations-dialog" aria-label="定时任务与通知">
+      <header class="auth-heading">
+        <div><span>Operations</span><h2>定时任务与通知</h2></div>
+        <button type="button" title="关闭" @click="operationsOpen = false"><X :size="16" /></button>
+      </header>
+      <form class="automation-form" @submit.prevent="createAutomation">
+        <input v-model.trim="automationForm.name" placeholder="任务名称" maxlength="160" required />
+        <textarea v-model.trim="automationForm.prompt" rows="3" placeholder="每次运行的任务描述" maxlength="20000" required />
+        <div>
+          <select v-model="automationForm.scheduleType" aria-label="调度类型"><option value="interval">固定间隔</option><option value="calendar">日历 / RRULE</option></select>
+          <label v-if="automationForm.scheduleType === 'interval'">间隔（分钟）<input v-model.number="automationForm.intervalMinutes" type="number" min="1" max="525600" /></label>
+          <template v-else><input v-model.trim="automationForm.rrule" aria-label="RRULE" placeholder="FREQ=DAILY;BYHOUR=9;BYMINUTE=0" /><input v-model.trim="automationForm.timezone" aria-label="时区" placeholder="Asia/Shanghai" /></template>
+          <select v-model="automationForm.notificationPolicy">
+            <option value="completion">完成或失败时通知</option><option value="failure">仅失败通知</option><option value="none">不通知</option>
+          </select>
+          <button type="submit" :disabled="!currentConversationId">创建</button>
+        </div>
+      </form>
+      <p v-if="operationsError" class="auth-error">{{ operationsError }}</p>
+      <div class="operations-columns">
+        <div><h3><Clock3 :size="14" /> 定时任务</h3>
+          <article v-for="item in automations" :key="item.id" class="memory-item operation-item">
+            <strong>{{ item.name }}</strong><small>{{ item.status }} · {{ item.rrule ? `${item.rrule} (${item.timezone})` : `每 ${Math.round(item.interval_seconds / 60)} 分钟` }}</small>
+            <p>{{ item.prompt }}</p><div><button type="button" @click="runAutomation(item)">立即运行</button><button type="button" class="danger" @click="removeAutomation(item)">删除</button></div>
+          </article><div v-if="!automations.length" class="trace-empty">暂无定时任务</div>
+        </div>
+        <div><h3><Bell :size="14" /> 通知</h3>
+          <article v-for="item in notifications" :key="item.id" :class="['memory-item', 'operation-item', { unread: !item.read }]" @click="markNotificationRead(item)">
+            <strong>{{ item.title }}</strong><p>{{ item.content }}</p><small>{{ item.created_at }}</small>
+          </article><div v-if="!notifications.length" class="trace-empty">暂无通知</div>
+        </div>
+      </div>
+      <div class="operations-integrations">
+        <section><h3><Bell :size="14" /> 外部通知</h3>
+          <form class="automation-form compact" @submit.prevent="createNotificationEndpoint">
+            <div><select v-model="endpointForm.kind"><option value="webhook">Webhook</option><option value="email">Email</option></select><input v-model.trim="endpointForm.name" placeholder="名称" required /><input v-model.trim="endpointForm.target" :placeholder="endpointForm.kind === 'email' ? 'name@example.com' : 'https://…'" required /></div>
+            <div><input v-if="endpointForm.kind === 'webhook'" v-model="endpointForm.secret" type="password" placeholder="签名密钥（可选）" /><button type="submit">添加通知目标</button></div>
+          </form>
+          <article v-for="item in notificationEndpoints" :key="item.id" class="memory-item operation-item"><strong>{{ item.name }}</strong><small>{{ item.kind }} · {{ item.target }}</small><div><button type="button" class="danger" @click="removeNotificationEndpoint(item)">删除</button></div></article>
+          <article v-for="item in notificationDeliveries.slice(0, 5)" :key="item.id" class="memory-item operation-item"><strong>投递：{{ item.endpoint }}</strong><small>{{ item.status }} · 尝试 {{ item.attempts }} 次</small><p v-if="item.last_error">{{ item.last_error }}</p></article>
+        </section>
+        <section><h3><GitBranch :size="14" /> GitHub Webhook / 行级 Review</h3>
+          <form class="automation-form compact" @submit.prevent="subscribeGithub">
+            <div><input v-model.trim="githubRepository" placeholder="owner/repository" required /><button type="submit">订阅仓库事件</button></div>
+          </form>
+          <form class="automation-form compact" @submit.prevent="submitGithubReview">
+            <div><input v-model.trim="githubReview.repository" placeholder="owner/repository" required /><input v-model.number="githubReview.number" type="number" min="1" placeholder="PR #" required /><select v-model="githubReview.event"><option>COMMENT</option><option>APPROVE</option><option>REQUEST_CHANGES</option></select></div>
+            <textarea v-model.trim="githubReview.body" rows="2" placeholder="Review 总结（可选）" />
+            <div><input v-model.trim="githubReview.path" placeholder="行级评论文件路径（可选）" /><input v-model.number="githubReview.line" type="number" min="1" placeholder="行号" /><select v-model="githubReview.side"><option>RIGHT</option><option>LEFT</option></select></div>
+            <textarea v-model.trim="githubReview.comment" rows="2" placeholder="行级评论" /><button type="submit">提交 Review</button>
+          </form>
+          <article v-for="item in githubSubscriptions" :key="item.id" class="memory-item operation-item"><strong>{{ item.repository }}</strong><div><button type="button" class="danger" @click="removeGithubSubscription(item)">取消订阅</button></div></article>
+        </section>
+      </div>
+    </section>
+  </div>
+
   <div v-if="authOpen" class="auth-overlay" @click.self="closeAuth">
     <form class="auth-dialog" @submit.prevent="submitAuth">
       <div class="auth-heading">
@@ -420,7 +479,7 @@
 <script setup>
 import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 import {
-  Activity, ArchiveRestore, Bot, Brain, ChevronDown, ChevronRight, ChevronsUp, Database, FilePlus2, FileText,
+  Activity, ArchiveRestore, Bell, Bot, Brain, ChevronDown, ChevronRight, ChevronsUp, Clock3, Database, FilePlus2, FileText,
   FolderOpen, FolderPlus, GitBranch, GitCompare, GitFork, Globe2, LogIn, LogOut, Paperclip, Play, Plus, RefreshCw, RotateCcw, Save,
   Pencil, SendHorizontal, ShieldCheck, Sparkles, Square, Trash2, UserRound, X,
 } from "lucide-vue-next";
@@ -464,6 +523,17 @@ const memoryQuery = ref("");
 const memoryEditing = ref("");
 const memorySettings = ref({ enabled: true, auto_capture: true, semantic_recall: true, user_scope: true, project_scope: true, conversation_scope: true, task_scope: true });
 const memoryForm = ref({ scope: "user", category: "fact", key: "", value: "", importance: 0.5, ttl_days: 0 });
+const operationsOpen = ref(false);
+const operationsError = ref("");
+const automations = ref([]);
+const notifications = ref([]);
+const notificationEndpoints = ref([]);
+const notificationDeliveries = ref([]);
+const githubSubscriptions = ref([]);
+const automationForm = ref({ name: "", prompt: "", scheduleType: "interval", intervalMinutes: 60, rrule: "FREQ=DAILY;BYHOUR=9;BYMINUTE=0", timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", notificationPolicy: "completion" });
+const endpointForm = ref({ kind: "webhook", name: "", target: "", secret: "" });
+const githubRepository = ref("");
+const githubReview = ref({ repository: "", number: 1, event: "COMMENT", body: "", path: "", line: 1, side: "RIGHT", comment: "" });
 const messages = ref([]);
 const messagesEl = ref(null);
 const terminalView = ref(null);
@@ -770,6 +840,86 @@ async function toggleArchived() {
   await loadConversations(true);
 }
 
+async function openOperations() {
+  operationsOpen.value = true;
+  operationsError.value = "";
+  try {
+    [automations.value, notifications.value, notificationEndpoints.value, notificationDeliveries.value, githubSubscriptions.value] = await Promise.all([
+      apiGet("/api/platform/automations"), apiGet("/api/platform/notifications"),
+      apiGet("/api/platform/notification-endpoints"), apiGet("/api/platform/notification-deliveries"),
+      apiGet("/api/platform/github/subscriptions"),
+    ]);
+  } catch (error) {
+    operationsError.value = readableError(error);
+  }
+}
+
+async function createAutomation() {
+  if (!currentConversationId.value) return;
+  try {
+    await apiPost("/api/platform/automations", {
+      conversation_id: currentConversationId.value,
+      name: automationForm.value.name,
+      prompt: automationForm.value.prompt,
+      interval_seconds: Math.max(60, Number(automationForm.value.intervalMinutes || 60) * 60),
+      rrule: automationForm.value.scheduleType === "calendar" ? automationForm.value.rrule : null,
+      timezone: automationForm.value.timezone || "UTC",
+      notification_policy: automationForm.value.notificationPolicy,
+    });
+    automationForm.value.name = ""; automationForm.value.prompt = "";
+    automations.value = await apiGet("/api/platform/automations");
+  } catch (error) { operationsError.value = readableError(error); }
+}
+
+async function createNotificationEndpoint() {
+  try {
+    await apiPost("/api/platform/notification-endpoints", endpointForm.value);
+    endpointForm.value = { kind: "webhook", name: "", target: "", secret: "" };
+    notificationEndpoints.value = await apiGet("/api/platform/notification-endpoints");
+  } catch (error) { operationsError.value = readableError(error); }
+}
+
+async function removeNotificationEndpoint(item) {
+  try { await apiDelete(`/api/platform/notification-endpoints/${item.id}`); notificationEndpoints.value = notificationEndpoints.value.filter(row => row.id !== item.id); }
+  catch (error) { operationsError.value = readableError(error); }
+}
+
+async function subscribeGithub() {
+  try { await apiPost("/api/platform/github/subscriptions", { repository: githubRepository.value }); githubRepository.value = ""; githubSubscriptions.value = await apiGet("/api/platform/github/subscriptions"); }
+  catch (error) { operationsError.value = readableError(error); }
+}
+
+async function removeGithubSubscription(item) {
+  try { await apiDelete(`/api/platform/github/subscriptions/${item.id}`); githubSubscriptions.value = githubSubscriptions.value.filter(row => row.id !== item.id); }
+  catch (error) { operationsError.value = readableError(error); }
+}
+
+async function submitGithubReview() {
+  const form = githubReview.value;
+  const comments = form.path && form.comment ? [{ path: form.path, line: Number(form.line), side: form.side, body: form.comment }] : [];
+  try { await apiPost("/api/platform/github/reviews", { repository: form.repository, number: Number(form.number), event: form.event, body: form.body, comments }); operationsError.value = ""; form.comment = ""; }
+  catch (error) { operationsError.value = readableError(error); }
+}
+
+async function runAutomation(item) {
+  try { await apiPost(`/api/platform/automations/${item.id}/run`, {}); await openOperations(); }
+  catch (error) { operationsError.value = readableError(error); }
+}
+
+async function removeAutomation(item) {
+  if (!window.confirm(`删除定时任务“${item.name}”？`)) return;
+  try {
+    await apiDelete(`/api/platform/automations/${item.id}`);
+    automations.value = automations.value.filter(row => row.id !== item.id);
+  } catch (error) { operationsError.value = readableError(error); }
+}
+
+async function markNotificationRead(item) {
+  if (item.read) return;
+  try { await apiPost(`/api/platform/notifications/${item.id}/read`, {}); item.read = true; }
+  catch (error) { operationsError.value = readableError(error); }
+}
+
 async function openMemoryPanel() {
   memoryOpen.value = true;
   memoryError.value = "";
@@ -959,6 +1109,8 @@ async function sendMessage() {
           [
             "turn_start", "turn_end", "thinking", "tool_use", "tool_update", "tool_result", "llm_response",
             "queued_message", "context_compacted", "message_queued", "memory_updated", "memory_recalled",
+            "memory_extraction_queued", "subagent_started", "subagent_progress", "subagent_finished",
+            "mcp_discovery",
             "status", "result", "sources", "approval_required", "hook", "error",
           ].includes(event.event)
           && event.content
