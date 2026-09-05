@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 from typing import AsyncIterator
 
-from ..core.rag import LocalRagStore, RetrievedChunk
+from ..core.rag import LocalRagStore, RetrievedChunk, route_rag_query
+from ..core.memory import memory_service
 from ..infra.config import get_settings
 from ..packages.agent import AgentRuntime
 from ..packages.ai import ModelProvider
@@ -22,40 +24,91 @@ class ChatbotMode:
     async def stream_rag(
         self,
         *,
-        message: str,
+        message: str | None,
         history: list[dict],
         use_rag: bool,
         use_web: bool,
         system_context: str | None = None,
         task_id: str | None = None,
+        user_id: int | None = None,
+        conversation_id: int | None = None,
         resume_state: dict | None = None,
     ) -> AsyncIterator[dict]:
         docs: list[RetrievedChunk] = []
         if use_rag and not resume_state:
-            yield {"event": "status", "content": f"Searching local knowledge: {message}"}
-            docs = await self.rag.search(message, top_k=5)
-            yield {"event": "result", "content": self._summarize_docs(docs) if docs else "No local knowledge matched."}
-            if docs:
-                yield {
-                    "event": "sources",
-                    "content": [
-                        {"source": doc.source, "title": doc.title, "chunk_id": doc.chunk_id, "score": doc.score}
-                        for doc in docs
-                    ],
-                }
+            decision = route_rag_query(message or "", history) if self.settings.rag_intent_routing else None
+            if decision is None or decision.should_retrieve:
+                retrieval_query = decision.query if decision else (message or "")
+                yield {"event": "status", "content": f"Searching local knowledge: {retrieval_query}"}
+                try:
+                    docs = await asyncio.wait_for(
+                        self.rag.search(retrieval_query, top_k=5),
+                        timeout=max(0.1, float(self.settings.rag_search_timeout_seconds)),
+                    )
+                except asyncio.TimeoutError:
+                    yield {
+                        "event": "status",
+                        "content": "Local knowledge search timed out; continuing without RAG.",
+                    }
+                    docs = []
+                except Exception as exc:
+                    yield {
+                        "event": "status",
+                        "content": f"Local knowledge search unavailable ({type(exc).__name__}); continuing without RAG.",
+                    }
+                    docs = []
+                yield {"event": "result", "content": self._summarize_docs(docs) if docs else "No sufficiently relevant local knowledge matched."}
+                if docs:
+                    yield {
+                        "event": "sources",
+                        "content": [
+                            {"source": doc.source, "title": doc.title, "chunk_id": doc.chunk_id, "score": doc.score}
+                            for doc in docs
+                        ],
+                    }
+            else:
+                yield {"event": "status", "content": f"Skipped local knowledge: {decision.reason}"}
 
         web_context = ""
         if use_web and not resume_state:
-            yield {"event": "status", "content": f"Searching the web: {message}"}
-            web_context = await self.tools.search_web(message)
+            yield {"event": "status", "content": f"Searching the web: {message or ''}"}
+            web_context = await self.tools.search_web(message or "")
             yield {"event": "result", "content": web_context[:1200]}
 
-        prompt = self._rag_prompt(message, docs, web_context)
+        prompt = None if resume_state is not None and message is None else self._rag_prompt(message or "", docs, web_context)
+        memory_context = ""
+        if user_id is not None:
+            recall_query = message or next(
+                (str(item.get("content") or "") for item in reversed(history) if item.get("role") == "user"),
+                "",
+            )
+            memories = await asyncio.to_thread(
+                memory_service.recall,
+                user_id=user_id,
+                query=recall_query,
+                conversation_id=conversation_id,
+                task_id=task_id,
+            )
+            memory_context = memory_service.format_for_prompt(memories)
+            if memories:
+                yield {
+                    "event": "memory_recalled",
+                    "content": {
+                        "count": len(memories),
+                        "memories": [
+                            {"id": item["id"], "scope": item["scope"], "key": item["key"]}
+                            for item in memories
+                        ],
+                    },
+                }
+        runtime_system = system_context or self._rag_system_prompt()
+        if memory_context:
+            runtime_system += "\n\n" + memory_context
         runtime = AgentRuntime(
             provider=self.provider,
-            model=self.settings.chat_model_id or self.settings.deepseek_model,
+            model=self.settings.chat_model_id or getattr(self.provider, "default_model", "") or self.settings.deepseek_model,
             tools=[],
-            system_prompt=system_context or self._rag_system_prompt(),
+            system_prompt=runtime_system,
             max_turns=1,
             task_id=task_id,
             permission_mode="read-only",

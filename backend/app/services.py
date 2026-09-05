@@ -7,7 +7,8 @@ from .core.code import CodeExecutor
 from .core.attachments import ChatAttachmentStore
 from .core.rag import LocalRagStore
 from .core.workspace import ConversationWorkspaceManager, WorkspaceEditor
-from .packages.ai import OpenAICompatibleProvider
+from .infra.config import get_settings
+from .packages.ai import ModelProvider, ProviderRegistry
 from .products import ChatbotMode, CodingAgentMode
 from .products.tool_registry import ProductToolRegistry
 
@@ -26,7 +27,7 @@ class ProductGateway:
     async def stream(
         self,
         *,
-        message: str,
+        message: str | None,
         history: list[dict],
         mode: str,
         use_rag: bool,
@@ -34,7 +35,10 @@ class ProductGateway:
         system_context: str | None = None,
         workspace_dir: str | None = None,
         task_id: str | None = None,
+        user_id: int | None = None,
+        conversation_id: int | None = None,
         permission_mode: str = "workspace-write",
+        project_trusted: bool = False,
         resume_state: dict | None = None,
     ) -> AsyncIterator[dict]:
         normalized = mode.lower().strip()
@@ -45,7 +49,10 @@ class ProductGateway:
                 system_context=system_context,
                 workspace_dir=workspace_dir,
                 task_id=task_id,
+                user_id=user_id,
+                conversation_id=conversation_id,
                 permission_mode=permission_mode,
+                project_trusted=project_trusted,
                 resume_state=resume_state,
             ):
                 yield event
@@ -60,6 +67,8 @@ class ProductGateway:
             use_web=use_web,
             system_context=system_context,
             task_id=task_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
             resume_state=resume_state,
         ):
             yield event
@@ -91,8 +100,23 @@ def get_conversation_workspace_manager() -> ConversationWorkspaceManager:
 
 
 @lru_cache
-def get_model_provider() -> OpenAICompatibleProvider:
-    return OpenAICompatibleProvider()
+def get_model_provider() -> ModelProvider:
+    return get_provider_registry().create(get_settings().coding_provider_id)
+
+
+@lru_cache
+def get_provider_registry() -> ProviderRegistry:
+    return ProviderRegistry()
+
+
+@lru_cache
+def get_chat_model_provider() -> ModelProvider:
+    return get_provider_registry().create(get_settings().chat_provider_id)
+
+
+@lru_cache
+def get_coding_model_provider() -> ModelProvider:
+    return get_provider_registry().create(get_settings().coding_provider_id)
 
 
 @lru_cache
@@ -103,7 +127,7 @@ def get_product_tool_registry() -> ProductToolRegistry:
 @lru_cache
 def get_chatbot_mode() -> ChatbotMode:
     return ChatbotMode(
-        provider=get_model_provider(),
+        provider=get_chat_model_provider(),
         rag=get_rag_store(),
         tools=get_product_tool_registry(),
     )
@@ -111,7 +135,7 @@ def get_chatbot_mode() -> ChatbotMode:
 
 @lru_cache
 def get_coding_agent_mode() -> CodingAgentMode:
-    return CodingAgentMode(provider=get_model_provider(), tools=get_product_tool_registry())
+    return CodingAgentMode(provider=get_coding_model_provider(), tools=get_product_tool_registry())
 
 
 @lru_cache

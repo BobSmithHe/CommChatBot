@@ -74,8 +74,13 @@ class LocalRagStore:
         self._dense_model = None
         self._dense_model_name = settings.rag_dense_model.strip()
         self._dense_vectors: list[list[float]] | None = None
+        self._min_dense_score = settings.rag_min_dense_score
+        self._min_lexical_score = settings.rag_min_lexical_score
         self._loaded = False
-        self._milvus = MilvusRagIndex()
+        # Explicit alternate indexes (especially tests) must never mirror into
+        # the application's shared production Milvus collection.
+        default_index = Path(settings.knowledge_index_path).resolve()
+        self._milvus = MilvusRagIndex() if self.index_path.resolve() == default_index else None
 
     def _load(self) -> None:
         if self._loaded:
@@ -107,7 +112,8 @@ class LocalRagStore:
                 )
             )
         self._save()
-        self._milvus.upsert([asdict(chunk) for chunk in self._chunks if chunk.doc_id == doc_id])
+        if self._milvus:
+            self._milvus.upsert([asdict(chunk) for chunk in self._chunks if chunk.doc_id == doc_id])
         return {"doc_id": doc_id, "source": source, "chunks": len(chunks)}
 
     def list_documents(self) -> list[dict]:
@@ -128,25 +134,29 @@ class LocalRagStore:
         if len(self._chunks) == before:
             return False
         self._save()
-        self._milvus.delete_document(doc_id)
+        if self._milvus:
+            self._milvus.delete_document(doc_id)
         return True
 
     def clear(self) -> None:
         self._chunks = []
         self._loaded = True
         self._save()
+        if self._milvus:
+            self._milvus.clear()
 
     async def search(self, query: str, top_k: int = 5) -> list[RetrievedChunk]:
         self._load()
         limit = max(top_k * 8, 20)
         bm25 = self._bm25(query, limit=limit) if self._chunks else []
         dense = await self._dense(query, limit=limit) if self._chunks else []
-        milvus_rows = await asyncio.to_thread(self._milvus.search, query, limit)
+        milvus_rows = await asyncio.to_thread(self._milvus.search, query, limit) if self._milvus else []
         milvus = [
             RetrievedChunk(
                 item["content"], item["score"], item["source"], item["title"], item["chunk_id"]
             )
             for item in milvus_rows
+            if float(item.get("score") or 0.0) >= self._min_dense_score
         ]
         ranked = [items for items in (bm25, dense, milvus) if items]
         merged = self._rrf_merge(ranked)
@@ -177,11 +187,15 @@ class LocalRagStore:
                 idf = math.log(1 + (n_docs - df[term] + 0.5) / (df[term] + 0.5))
                 denom = tf[term] + 1.5 * (1 - 0.75 + 0.75 * len(doc_terms) / max(avgdl, 1))
                 score += idf * (tf[term] * 2.5) / denom
-            if score > 0:
-                scored.append(self._to_result(chunk, score))
+            normalized = 1.0 - math.exp(-score)
+            if normalized >= self._min_lexical_score:
+                scored.append(self._to_result(chunk, normalized))
         return sorted(scored, key=lambda item: item.score, reverse=True)[:limit]
 
     async def _dense(self, query: str, limit: int) -> list[RetrievedChunk]:
+        return await asyncio.to_thread(self._dense_sync, query, limit)
+
+    def _dense_sync(self, query: str, limit: int) -> list[RetrievedChunk]:
         if not self._dense_model_name:
             return []
         try:
@@ -203,11 +217,13 @@ class LocalRagStore:
         scored = []
         for chunk, vector in zip(self._chunks, self._dense_vectors):
             score = sum(a * b for a, b in zip(q_vec, vector))
-            scored.append(self._to_result(chunk, score))
+            if score >= self._min_dense_score:
+                scored.append(self._to_result(chunk, score))
         return sorted(scored, key=lambda item: item.score, reverse=True)[:limit]
 
     def _rrf_merge(self, ranked_lists: Iterable[list[RetrievedChunk]]) -> list[RetrievedChunk]:
         scores: dict[str, float] = {}
+        relevance: dict[str, list[float]] = defaultdict(list)
         docs: dict[str, RetrievedChunk] = {}
         for ranked in ranked_lists:
             seen: set[str] = set()
@@ -217,11 +233,13 @@ class LocalRagStore:
                     continue
                 seen.add(key)
                 scores[key] = scores.get(key, 0.0) + 1.0 / (60 + rank)
+                relevance[key].append(float(item.score))
                 docs.setdefault(key, item)
         merged = []
-        for key in sorted(scores, key=scores.get, reverse=True):
+        for key in sorted(scores, key=lambda item: (scores[item], max(relevance[item])), reverse=True):
             item = docs[key]
-            merged.append(RetrievedChunk(item.content, round(scores[key], 4), item.source, item.title, item.chunk_id))
+            confidence = min(1.0, max(relevance[key]) + 0.02 * (len(relevance[key]) - 1))
+            merged.append(RetrievedChunk(item.content, round(confidence, 4), item.source, item.title, item.chunk_id))
         return merged
 
     @staticmethod

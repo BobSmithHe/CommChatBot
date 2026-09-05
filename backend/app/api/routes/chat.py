@@ -7,9 +7,11 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
-from ...infra.database import AgentTask, Message, SessionLocal, User, get_db
-from ...core.runtime_state import TaskCancelled, runtime_task_manager
-from ...services import get_chat_attachment_store, get_chat_orchestrator
+from ...infra.config import get_settings
+from ...infra.database import AgentTask, Message, RuntimeEventRecord, SessionLocal, User, get_db
+from ...core.runtime_state import runtime_task_manager
+from ...core.task_queue import task_queue
+from ...services import get_chat_attachment_store
 from ...sse import sse
 from ..conversation_utils import conversation_history, ensure_conversation_workspace, get_or_create_conversation
 from ..deps import current_user
@@ -56,6 +58,21 @@ async def chat_stream(req: ChatRequest, user: User = Depends(current_user), db: 
         conv = get_or_create_conversation(db, user.id, stored_task.conversation_id, stored_task.mode)
         model_message = stored_task.prompt
         history: list[dict] = []
+        try:
+            request_payload = json.loads(stored_task.request_json or "{}")
+        except (TypeError, json.JSONDecodeError):
+            request_payload = {}
+        request_payload.setdefault("model_message", model_message)
+        request_payload.setdefault("history", history)
+        request_payload.setdefault("use_rag", req.use_rag)
+        request_payload.setdefault("use_web", req.use_web)
+        request_payload.setdefault("system_context", req.system_context)
+        candidate_prompt = req.message.strip()
+        request_payload["resume_prompt"] = (
+            candidate_prompt if candidate_prompt != stored_task.prompt.strip() else None
+        )
+        stored_task.request_json = json.dumps(request_payload, ensure_ascii=False)
+        db.commit()
     else:
         try:
             attachments = get_chat_attachment_store().load_many(req.attachment_ids, user_id=user.id)
@@ -79,75 +96,60 @@ async def chat_stream(req: ChatRequest, user: User = Depends(current_user), db: 
         if conv.title == "New Conversation":
             conv.title = req.message[:40] + ("..." if len(req.message) > 40 else "")
         db.commit()
+        request_payload = {
+            "model_message": model_message,
+            "history": history,
+            "use_rag": req.use_rag,
+            "use_web": req.use_web,
+            "system_context": req.system_context,
+            "project_trusted": bool(conv.project_trusted),
+        }
         task = runtime_task_manager.create(
             user_id=user.id,
             conversation_id=conv.id,
             mode=req.mode,
             prompt=req.message,
+            status="queued",
+            request=request_payload,
         )
-    workspace_dir = None
     if conv.mode == "coding-agent":
-        workspace_dir = str(ensure_conversation_workspace(db, conv).root)
-    conv_id = conv.id
-    user_id = user.id
+        ensure_conversation_workspace(db, conv)
+
+    task_queue.enqueue(task.id)
 
     async def events():
-        full_answer = ""
-        runtime_trace: list[dict] = []
         yield sse("task", {"task_id": task.id, "status": "running", "resumed": resumed})
-        runtime_task_manager.append_event(task.id, "task", {"status": "running", "resumed": resumed})
-        yield sse("status", f"Connected. mode={req.mode}")
-        try:
-            async for event in get_chat_orchestrator().stream(
-                message=model_message,
-                history=history,
-                mode=req.mode,
-                use_rag=req.use_rag,
-                use_web=req.use_web,
-                system_context=req.system_context,
-                workspace_dir=workspace_dir,
-                task_id=task.id,
-                permission_mode=conv.permission_mode,
-                resume_state=resume_state,
-            ):
-                if event.get("event") == "answer":
-                    full_answer += str(event.get("content") or "")
-                elif event.get("event") in {"status", "result", "sources", "approval_required", "hook"} and event.get("content"):
-                    runtime_trace.append(
-                        {"event": str(event.get("event")), "content": event.get("content")}
-                    )
-                if event.get("event") != "answer":
-                    runtime_task_manager.append_event(task.id, str(event.get("event", "status")), event.get("content"))
-                yield sse(event.get("event", "status"), event.get("content", ""))
-        except TaskCancelled as exc:
-            runtime_task_manager.append_event(task.id, "cancelled", str(exc))
-            yield sse("cancelled", str(exc))
-        except asyncio.CancelledError:
-            runtime_task_manager.finish(task.id, "interrupted", "Client disconnected")
-            raise
-        except Exception as exc:
-            runtime_task_manager.append_event(task.id, "error", f"{type(exc).__name__}: {exc}")
-            runtime_task_manager.finish(task.id, "failed", f"{type(exc).__name__}: {exc}")
-            yield sse("status", f"Request failed: {type(exc).__name__}: {exc}")
-        if full_answer:
-            runtime_task_manager.append_event(task.id, "answer", full_answer)
-            with SessionLocal() as write_db:
-                write_db.add(
-                    Message(
-                        user_id=user_id,
-                        conversation_id=conv_id,
-                        role="assistant",
-                        content=full_answer,
-                        trace_json=json.dumps(runtime_trace, ensure_ascii=False),
-                    )
-                )
-                write_db.commit()
-        if runtime_task_manager.cancelled(task.id):
-            runtime_task_manager.finish(task.id, "cancelled")
-        elif full_answer:
-            runtime_task_manager.finish(task.id, "completed")
-        else:
-            runtime_task_manager.finish(task.id, "failed", "No answer was generated")
+        cursor = 0
+        idle_ticks = 0
+        error_sent = False
+        terminal_statuses = {"completed", "failed", "cancelled", "interrupted"}
+        while True:
+            with SessionLocal() as read_db:
+                rows = read_db.query(RuntimeEventRecord).filter(
+                    RuntimeEventRecord.task_id == task.id,
+                    RuntimeEventRecord.id > cursor,
+                ).order_by(RuntimeEventRecord.id).limit(200).all()
+                current = read_db.query(AgentTask.status, AgentTask.error).filter(AgentTask.id == task.id).first()
+                status = current[0] if current else "failed"
+                task_error = current[1] if current else "Task record no longer exists"
+                serialized = [(row.id, row.event_type, row.content_json) for row in rows]
+            for event_id, event_type, raw_content in serialized:
+                cursor = event_id
+                try:
+                    content = json.loads(raw_content) if raw_content is not None else ""
+                except json.JSONDecodeError:
+                    content = raw_content or ""
+                if event_type == "error":
+                    error_sent = True
+                yield sse(event_type, content)
+            if status in terminal_statuses and not serialized:
+                if status == "failed" and not error_sent:
+                    yield sse("error", task_error or "Task failed")
+                break
+            idle_ticks += 1
+            if idle_ticks % 100 == 0:
+                yield ": keep-alive\n\n"
+            await asyncio.sleep(max(0.05, get_settings().task_event_poll_ms / 1000))
         yield sse("done")
 
     return StreamingResponse(events(), media_type="text/event-stream")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
+import uuid
 
 from ..ai import LLMMessage
 
@@ -10,6 +11,7 @@ from ..ai import LLMMessage
 class AgentMessage:
     type: str
     content: Any
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
     tool_call_id: str | None = None
     tool_name: str | None = None
     is_error: bool = False
@@ -29,6 +31,7 @@ class AgentMessage:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "id": self.id,
             "type": self.type,
             "content": self.content,
             "tool_call_id": self.tool_call_id,
@@ -40,6 +43,7 @@ class AgentMessage:
     @classmethod
     def from_dict(cls, payload: dict[str, Any]) -> "AgentMessage":
         return cls(
+            id=str(payload.get("id") or uuid.uuid4().hex),
             type=str(payload.get("type") or "user"),
             content=payload.get("content"),
             tool_call_id=payload.get("tool_call_id"),

@@ -10,10 +10,15 @@ sys.path.insert(0, str(ROOT))
 from app.core.code import CodeExecutor
 from app.core.rag import LocalRagStore
 from app.main import app
+from app.infra.security import create_access_token, decode_access_token
 
 
 def test_app_imports():
     assert app.title == "CommChatBot"
+
+
+def test_access_token_round_trip():
+    assert decode_access_token(create_access_token("42")) == "42"
 
 
 def test_code_executor_runs_python():
@@ -28,4 +33,3 @@ def test_local_rag_search(tmp_path):
     results = asyncio.run(store.search("OFDM subcarrier spacing", top_k=2))
     assert results
     assert results[0].source == "ofdm.md"
-

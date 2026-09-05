@@ -4,11 +4,12 @@ import asyncio
 import os
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 from ...infra.config import get_settings
+from ..sandbox import run_sandboxed
 
 
 IMAGE_CAPTURE_SUFFIX = r"""
@@ -43,13 +44,31 @@ class CodeExecutor:
     def __init__(self, timeout: int | None = None) -> None:
         self.timeout = timeout or get_settings().code_exec_timeout
 
-    async def execute(self, code: str, language: str = "python") -> dict:
+    async def execute(
+        self,
+        code: str,
+        language: str = "python",
+        workspace_dir: str | os.PathLike | None = None,
+    ) -> dict:
         if language.lower() not in {"python", "py"}:
             return {"stdout": "", "stderr": f"Unsupported language: {language}", "exit_code": -1, "images": []}
 
-        tmpdir = tempfile.mkdtemp(prefix="commchat-code-")
-        script = os.path.join(tmpdir, "main.py")
-        with open(script, "w", encoding="utf-8") as handle:
+        temporary_root = None
+        if workspace_dir is None:
+            execution_root = Path(tempfile.mkdtemp(prefix="commchat-code-")).resolve()
+            temporary_root = execution_root
+        else:
+            execution_root = Path(workspace_dir).resolve()
+            if not execution_root.is_dir():
+                raise ValueError("Code execution workspace does not exist")
+        descriptor, script_name = tempfile.mkstemp(
+            prefix=".commchat-exec-",
+            suffix=".py",
+            dir=execution_root,
+        )
+        os.close(descriptor)
+        script = Path(script_name)
+        with script.open("w", encoding="utf-8") as handle:
             handle.write(self._wrap(code))
 
         try:
@@ -58,20 +77,21 @@ class CodeExecutor:
             env["MPLBACKEND"] = "Agg"
 
             def _run():
-                return subprocess.run(
-                    [sys.executable, script],
-                    cwd=tmpdir,
+                return run_sandboxed(
+                    [sys.executable, str(script)],
+                    cwd=execution_root,
                     env=env,
-                    capture_output=True,
                     timeout=self.timeout,
                 )
 
             proc = await asyncio.to_thread(_run)
+            if proc.timed_out:
+                return {"stdout": "", "stderr": f"Execution timed out after {self.timeout}s", "exit_code": -1, "images": []}
             return self._parse(proc.stdout, proc.stderr, proc.returncode)
-        except subprocess.TimeoutExpired:
-            return {"stdout": "", "stderr": f"Execution timed out after {self.timeout}s", "exit_code": -1, "images": []}
         finally:
-            shutil.rmtree(tmpdir, ignore_errors=True)
+            script.unlink(missing_ok=True)
+            if temporary_root is not None:
+                shutil.rmtree(temporary_root, ignore_errors=True)
 
     def _wrap(self, code: str) -> str:
         return (
@@ -105,4 +125,3 @@ class CodeExecutor:
             "exit_code": int(exit_code),
             "images": images,
         }
-

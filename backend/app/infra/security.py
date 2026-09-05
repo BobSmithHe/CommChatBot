@@ -4,7 +4,10 @@ import base64
 import hashlib
 import hmac
 import os
+import secrets
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
+from pathlib import Path
 
 from jose import JWTError, jwt
 
@@ -33,13 +36,13 @@ def create_access_token(subject: str) -> str:
         "type": "access",
         "exp": datetime.now(timezone.utc) + timedelta(minutes=settings.jwt_expire_minutes),
     }
-    return jwt.encode(payload, settings.jwt_secret_key, algorithm=settings.jwt_algorithm)
+    return jwt.encode(payload, _jwt_secret(), algorithm=settings.jwt_algorithm)
 
 
 def decode_access_token(token: str) -> str | None:
     settings = get_settings()
     try:
-        payload = jwt.decode(token, settings.jwt_secret_key, algorithms=[settings.jwt_algorithm])
+        payload = jwt.decode(token, _jwt_secret(), algorithms=[settings.jwt_algorithm])
     except JWTError:
         return None
     if payload.get("type") != "access":
@@ -47,3 +50,19 @@ def decode_access_token(token: str) -> str | None:
     subject = payload.get("sub")
     return str(subject) if subject else None
 
+
+@lru_cache
+def _jwt_secret() -> str:
+    settings = get_settings()
+    configured = settings.jwt_secret_key.strip()
+    if configured and not configured.lower().startswith(("change-me", "replace-with")):
+        return configured
+    secret_path = Path(settings.data_dir) / ".jwt-secret"
+    if secret_path.is_file():
+        stored = secret_path.read_text(encoding="utf-8").strip()
+        if len(stored) >= 32:
+            return stored
+    generated = secrets.token_urlsafe(48)
+    secret_path.parent.mkdir(parents=True, exist_ok=True)
+    secret_path.write_text(generated, encoding="utf-8")
+    return generated

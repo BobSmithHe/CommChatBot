@@ -3,9 +3,8 @@ from __future__ import annotations
 import time
 from typing import Any
 
-import httpx
-
 from ...infra.config import get_settings
+from ..embeddings import get_embedding_model
 
 
 class MilvusRagIndex:
@@ -44,6 +43,15 @@ class MilvusRagIndex:
         self._client.delete(collection_name=self.collection_name, filter=f'doc_id == "{escaped}"', timeout=10)
         return True
 
+    def clear(self) -> bool:
+        if not self._ensure():
+            return False
+        if self._client.has_collection(collection_name=self.collection_name):
+            self._client.drop_collection(collection_name=self.collection_name)
+        self._client = None
+        self._retry_after = 0.0
+        return True
+
     def search(self, query: str, limit: int) -> list[dict[str, Any]]:
         if not query or not self._ensure():
             return []
@@ -75,16 +83,12 @@ class MilvusRagIndex:
         if self._client is not None:
             return True
         try:
-            health = httpx.get(self.settings.milvus_uri.rstrip("/") + "/healthz", timeout=0.75)
-            if health.status_code >= 500:
-                raise ConnectionError(f"Milvus health returned {health.status_code}")
             from pymilvus import MilvusClient
-            from sentence_transformers import SentenceTransformer
 
             client = MilvusClient(
                 uri=self.settings.milvus_uri,
-                token=self.settings.milvus_token,
-                db_name=self.settings.milvus_db_name,
+                token=self.settings.milvus_token or None,
+                db_name=self.settings.milvus_db_name or "default",
                 timeout=2,
             )
             if not client.has_collection(collection_name=self.collection_name):
@@ -99,9 +103,9 @@ class MilvusRagIndex:
                     max_length=128,
                     enable_dynamic_field=True,
                 )
-            self._model = SentenceTransformer(
+            self._model = get_embedding_model(
                 self.settings.embedding_model,
-                device=self.settings.embedding_device,
+                self.settings.embedding_device,
             )
             self._client = client
             return True

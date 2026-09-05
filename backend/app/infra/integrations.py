@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import ipaddress
 import json
+import shutil
+import subprocess
 from functools import lru_cache
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 
@@ -115,9 +119,46 @@ class ExternalIntegrations:
         return {
             "mysql": self._mysql_health(),
             "redis": "ok" if self._redis_client() else "unavailable",
-            "milvus": self._http_health(self.settings.milvus_uri.rstrip("/") + "/healthz"),
+            "milvus": self._milvus_health(),
             "langfuse": self._http_health(self.settings.langfuse_host.rstrip("/") + "/api/public/health"),
+            "sandbox": self._sandbox_health(),
         }
+
+    def _sandbox_health(self) -> str:
+        if self.settings.sandbox_mode.casefold() != "docker":
+            return f"ok ({self.settings.sandbox_mode})"
+        docker = shutil.which("docker")
+        if not docker:
+            return "unavailable"
+        try:
+            result = subprocess.run(
+                [docker, "image", "inspect", self.settings.sandbox_image],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return "ok (docker)" if result.returncode == 0 else "image unavailable"
+        except (OSError, subprocess.TimeoutExpired):
+            return "unavailable"
+
+    def _milvus_health(self) -> str:
+        try:
+            from pymilvus import MilvusClient
+
+            client = MilvusClient(
+                uri=self.settings.milvus_uri,
+                token=self.settings.milvus_token or None,
+                db_name=self.settings.milvus_db_name or "default",
+                timeout=2,
+            )
+            client.list_collections(timeout=2)
+            client.close()
+            return "ok"
+        except Exception:
+            return "unavailable"
 
     def _redis_client(self):
         if self._redis is False:
@@ -156,12 +197,22 @@ class ExternalIntegrations:
                     return None
                 from langfuse import Langfuse
 
+                # Local self-hosted Langfuse must not be routed through a
+                # machine-wide HTTP(S) proxy.  Proxying localhost can produce
+                # misleading empty 502 responses even though Langfuse itself
+                # is healthy.  Remote deployments keep the normal proxy
+                # behaviour.
+                http_client = httpx.Client(
+                    timeout=2,
+                    trust_env=self._trust_env_for_url(self.settings.langfuse_host),
+                )
                 self._langfuse = Langfuse(
                     public_key=self.settings.langfuse_public_key,
                     secret_key=self.settings.langfuse_secret_key,
                     host=self.settings.langfuse_host,
                     timeout=2,
                     flush_at=20,
+                    httpx_client=http_client,
                 )
             except Exception:
                 self._langfuse = False
@@ -186,11 +237,35 @@ class ExternalIntegrations:
 
     @staticmethod
     def _http_health(url: str) -> str:
+        # Self-hosted services can take longer than a sub-second timeout while
+        # their Docker container is warming up.  A small retry avoids reporting
+        # a healthy local Langfuse instance as unavailable without making the
+        # general health endpoint block for an excessive amount of time.
+        with httpx.Client(
+            timeout=2.0,
+            trust_env=ExternalIntegrations._trust_env_for_url(url),
+        ) as client:
+            for attempt in range(2):
+                try:
+                    response = client.get(url)
+                    return "ok" if response.status_code < 500 else f"http-{response.status_code}"
+                except (httpx.TimeoutException, httpx.NetworkError):
+                    if attempt:
+                        return "unavailable"
+                except Exception:
+                    return "unavailable"
+        return "unavailable"
+
+    @staticmethod
+    def _trust_env_for_url(url: str) -> bool:
+        """Use environment proxies except for localhost/loopback services."""
+        hostname = (urlparse(url).hostname or "").casefold()
+        if hostname == "localhost":
+            return False
         try:
-            response = httpx.get(url, timeout=0.75)
-            return "ok" if response.status_code < 500 else f"http-{response.status_code}"
-        except Exception:
-            return "unavailable"
+            return not ipaddress.ip_address(hostname).is_loopback
+        except ValueError:
+            return True
 
 
 @lru_cache

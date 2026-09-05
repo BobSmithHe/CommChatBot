@@ -6,6 +6,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from ..core.workspace import ConversationWorkspaceManager, WorkspaceEditor
+from ..core.context import context_manager
 from ..infra.database import Conversation, Message
 
 
@@ -53,8 +54,7 @@ def ensure_conversation_workspace(db: Session, conv: Conversation) -> WorkspaceE
 
 
 def conversation_history(db: Session, conversation_id: int) -> list[dict]:
-    rows = db.query(Message).filter(Message.conversation_id == conversation_id).order_by(Message.id.asc()).all()
-    return [{"role": row.role, "content": row.content} for row in rows if row.role in {"user", "assistant", "system"}]
+    return context_manager.prepare(db, conversation_id)
 
 
 def conversation_payload(conv: Conversation, message_count: int) -> dict:
@@ -64,6 +64,10 @@ def conversation_payload(conv: Conversation, message_count: int) -> dict:
         "workspace_id": conv.workspace_id,
         "permission_mode": getattr(conv, "permission_mode", "workspace-write"),
         "is_archived": bool(getattr(conv, "is_archived", False)),
+        "parent_conversation_id": getattr(conv, "parent_conversation_id", None),
+        "forked_from_message_id": getattr(conv, "forked_from_message_id", None),
+        "branch_name": getattr(conv, "branch_name", "main") or "main",
+        "project_trusted": bool(getattr(conv, "project_trusted", False)),
         "title": conv.title,
         "message_count": message_count,
         "created_at": conv.created_at.isoformat() if conv.created_at else None,

@@ -6,9 +6,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 from ...core.runtime_state import runtime_task_manager
-from ...infra.database import AgentTask, ApprovalRequestRecord, RuntimeEventRecord, User, get_db
+from ...infra.database import AgentTask, ApprovalRequestRecord, ModelUsageRecord, RuntimeEventRecord, User, get_db
 from ..deps import current_user
-from ..schemas import ApprovalDecisionRequest
+from ..schemas import ApprovalDecisionRequest, TaskMessageRequest
 
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
@@ -52,6 +52,7 @@ def get_task(task_id: str, user: User = Depends(current_user), db: Session = Dep
     task = _require_task(db, user.id, task_id)
     events = db.query(RuntimeEventRecord).filter(RuntimeEventRecord.task_id == task.id).order_by(RuntimeEventRecord.id).all()
     approvals = db.query(ApprovalRequestRecord).filter(ApprovalRequestRecord.task_id == task.id).order_by(ApprovalRequestRecord.created_at).all()
+    usage_rows = db.query(ModelUsageRecord).filter(ModelUsageRecord.task_id == task.id).all()
     return {
         **_payload(task),
         "events": [
@@ -72,7 +73,29 @@ def get_task(task_id: str, user: User = Depends(current_user), db: Session = Dep
             }
             for item in approvals
         ],
+        "usage": {
+            "input_tokens": sum(item.input_tokens for item in usage_rows),
+            "output_tokens": sum(item.output_tokens for item in usage_rows),
+            "cache_read_tokens": sum(item.cache_read_tokens for item in usage_rows),
+            "cache_write_tokens": sum(item.cache_write_tokens for item in usage_rows),
+            "cost_usd": round(sum(item.cost_usd for item in usage_rows), 8),
+        },
     }
+
+
+@router.post("/{task_id}/messages")
+def enqueue_task_message(
+    task_id: str,
+    req: TaskMessageRequest,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    _require_task(db, user.id, task_id)
+    queued = runtime_task_manager.enqueue_message(task_id, req.kind, req.content)
+    if not queued:
+        raise HTTPException(status_code=409, detail="Task is not accepting queued messages")
+    runtime_task_manager.append_event(task_id, "message_queued", {"id": queued["id"], "kind": queued["kind"]})
+    return {"status": "queued", **queued}
 
 
 @router.post("/{task_id}/cancel")

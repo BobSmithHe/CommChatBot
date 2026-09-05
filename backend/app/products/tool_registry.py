@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import json
 
 import httpx
@@ -34,8 +35,11 @@ class ProductToolRegistry:
             self.search_files_tool(editor),
             self.write_file_tool(editor),
             self.replace_in_file_tool(editor),
+            self.apply_patch_tool(editor),
+            self.get_diagnostics_tool(editor),
+            self.review_changes_tool(editor),
             self.run_command_tool(editor),
-            self.execute_python_tool(),
+            self.execute_python_tool(editor),
         ]
 
     def list_files_tool(self, workspace: WorkspaceEditor | None = None) -> Tool:
@@ -92,6 +96,16 @@ class ProductToolRegistry:
 
     def write_file_tool(self, workspace: WorkspaceEditor | None = None) -> Tool:
         editor = workspace or self.workspace
+
+        def write_with_diagnostics(path: str, content: str, overwrite: bool = False) -> str:
+            try:
+                before = editor.read_text(path)
+            except ValueError:
+                before = None
+            result = editor.write_file(path, content, overwrite)
+            diff = self._operation_diff(path, before, content)
+            return self._mutation_feedback(result, editor, [path], diff)
+
         return Tool(
             name="write_file",
             description="Create a UTF-8 text file in the workspace. Existing files require explicit overwrite=true.",
@@ -104,12 +118,22 @@ class ProductToolRegistry:
                 },
                 "required": ["path", "content"],
             },
-            handler=editor.write_file,
+            handler=write_with_diagnostics,
             capability="write",
         )
 
     def replace_in_file_tool(self, workspace: WorkspaceEditor | None = None) -> Tool:
         editor = workspace or self.workspace
+
+        def replace_with_diagnostics(
+            path: str, old_text: str, new_text: str, replace_all: bool = False
+        ) -> str:
+            before = editor.read_text(path)
+            result = editor.replace_in_file(path, old_text, new_text, replace_all)
+            after = editor.read_text(path)
+            diff = self._operation_diff(path, before, after)
+            return self._mutation_feedback(result, editor, [path], diff)
+
         return Tool(
             name="replace_in_file",
             description="Edit a workspace file by exact text replacement. Ambiguous matches are rejected by default.",
@@ -123,8 +147,55 @@ class ProductToolRegistry:
                 },
                 "required": ["path", "old_text", "new_text"],
             },
-            handler=editor.replace_in_file,
+            handler=replace_with_diagnostics,
             capability="write",
+        )
+
+    def apply_patch_tool(self, workspace: WorkspaceEditor | None = None) -> Tool:
+        editor = workspace or self.workspace
+        return Tool(
+            name="apply_patch",
+            description=(
+                "Validate and apply a unified diff to one or more workspace files atomically. "
+                "Paths must remain inside the workspace; binary patches are rejected."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {"patch": {"type": "string"}},
+                "required": ["patch"],
+            },
+            handler=editor.apply_patch,
+            capability="write",
+        )
+
+    def get_diagnostics_tool(self, workspace: WorkspaceEditor | None = None) -> Tool:
+        editor = workspace or self.workspace
+
+        def get_diagnostics(paths: list[str] | None = None) -> str:
+            items = editor.diagnostics(paths)
+            return json.dumps({"diagnostic_count": len(items), "diagnostics": items}, ensure_ascii=False)
+
+        return Tool(
+            name="get_diagnostics",
+            description=(
+                "Get workspace language diagnostics from LSP/Ruff for selected Python files. "
+                "With no paths, checks changed files and then a bounded Python fallback set."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {"paths": {"type": "array", "items": {"type": "string"}}},
+            },
+            handler=get_diagnostics,
+            execution_mode="parallel",
+        )
+
+    def review_changes_tool(self, workspace: WorkspaceEditor | None = None) -> Tool:
+        editor = workspace or self.workspace
+        return Tool(
+            name="review_changes",
+            description="Review the complete workspace diff together with static diagnostics before finalizing.",
+            input_schema={"type": "object", "properties": {}},
+            handler=editor.review_changes,
         )
 
     def run_command_tool(self, workspace: WorkspaceEditor | None = None) -> Tool:
@@ -133,7 +204,8 @@ class ProductToolRegistry:
             name="run_command",
             description=(
                 "Run a bounded project verification command without shell parsing. "
-                "Allowed commands: pytest, npm run/test, read-only git status/diff/log/show, and rg."
+                "Allowed commands: Python file execution, pytest, npm run/test, "
+                "read-only git status/diff/log/show, and rg."
             ),
             input_schema={
                 "type": "object",
@@ -171,12 +243,20 @@ class ProductToolRegistry:
             capability="network",
         )
 
-    def execute_python_tool(self) -> Tool:
+    def execute_python_tool(self, workspace: WorkspaceEditor | None = None) -> Tool:
+        editor = workspace or self.workspace
+
+        async def execute_in_workspace(code: str) -> str:
+            return await self.execute_python(code, workspace_dir=editor.root)
+
         return Tool(
             name="execute_python",
-            description="Execute Python code and return stdout, stderr, exit code, and image count.",
+            description=(
+                "Execute temporary Python code with the current project mounted at /workspace, "
+                "and return stdout, stderr, exit code, and image count."
+            ),
             input_schema={"type": "object", "properties": {"code": {"type": "string"}}, "required": ["code"]},
-            handler=self.execute_python,
+            handler=execute_in_workspace,
             capability="execute",
         )
 
@@ -186,12 +266,13 @@ class ProductToolRegistry:
             return "No local knowledge results found."
         return "\n\n".join(f"[{doc.source}] score={doc.score}\n{doc.content[:1600]}" for doc in docs)
 
-    async def execute_python(self, code: str) -> str:
-        result = await self.code_executor.execute(code, "python")
+    async def execute_python(self, code: str, workspace_dir=None) -> str:
+        result = await self.code_executor.execute(code, "python", workspace_dir=workspace_dir)
         payload = {
             "stdout": result.get("stdout", ""),
             "stderr": result.get("stderr", ""),
             "exit_code": result.get("exit_code", -1),
+            "timed_out": bool(result.get("timed_out", False)),
             "image_count": len(result.get("images") or []),
         }
         return json.dumps(payload, ensure_ascii=False)
@@ -212,3 +293,27 @@ class ProductToolRegistry:
             f"[Web] {item.get('title', '')}\n{item.get('url', '')}\n{str(item.get('content', ''))[:800]}"
             for item in results
         )
+
+    @staticmethod
+    def _mutation_feedback(
+        result: str, editor: WorkspaceEditor, paths: list[str], diff: str
+    ) -> str:
+        diagnostics = editor.diagnostics(paths)
+        return json.dumps(
+            {
+                "message": result,
+                "diagnostic_count": len(diagnostics),
+                "diagnostics": diagnostics,
+                "diff": diff,
+            },
+            ensure_ascii=False,
+        )
+
+    @staticmethod
+    def _operation_diff(path: str, before: str | None, after: str) -> str:
+        return "".join(difflib.unified_diff(
+            (before or "").splitlines(keepends=True),
+            after.splitlines(keepends=True),
+            fromfile=f"a/{path}" if before is not None else "/dev/null",
+            tofile=f"b/{path}",
+        ))[-50000:]
