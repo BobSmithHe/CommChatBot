@@ -9,6 +9,7 @@ import httpx
 from app.infra.config import get_settings
 from app.agent_runtime import Tool
 from app.extensions.builtin.workspace import WorkspaceEditor
+from app.platform.services.lazy import LazyService
 
 
 class GitHubIntegration:
@@ -132,4 +133,4 @@ class GitHubIntegration:
         return str(result.get("stdout") or result.get("command_output") or "")
 
 
-github_integration = GitHubIntegration()
+github_integration = LazyService(GitHubIntegration)

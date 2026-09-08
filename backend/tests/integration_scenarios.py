@@ -10,11 +10,13 @@ import sys
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from app.platform.database import init_db
+from app.infra.config import get_settings
+from app.platform.database import RemoteJobRecord, SessionLocal, init_db
 from app.main import app
 
 
@@ -25,7 +27,14 @@ def register_and_login(client: TestClient, prefix: str) -> tuple[dict, dict]:
     assert response.status_code == 200, response.text
     session = client.post("/api/auth/login", json=account)
     assert session.status_code == 200, session.text
-    return account, session.json()
+    cookie_header = session.headers.get("set-cookie", "").casefold()
+    assert "httponly" in cookie_header
+    assert "samesite=lax" in cookie_header
+    assert "path=/api/auth" in cookie_header
+    payload = session.json()
+    payload["_refresh_cookie"] = session.cookies.get(get_settings().refresh_cookie_name)
+    assert payload["_refresh_cookie"] and "refresh_token" not in payload
+    return account, payload
 
 
 def headers(session: dict) -> dict:
@@ -33,16 +42,23 @@ def headers(session: dict) -> dict:
 
 
 def auth_scenario(client: TestClient) -> None:
+    _cookie_account, cookie_session = register_and_login(client, "cookie")
+    cookie_refresh = client.post("/api/auth/refresh", json={})
+    assert cookie_refresh.status_code == 200, cookie_refresh.text
+    assert "refresh_token" not in cookie_refresh.json()
+    rotated_cookie = cookie_refresh.cookies.get(get_settings().refresh_cookie_name)
+    assert rotated_cookie and rotated_cookie != cookie_session["_refresh_cookie"]
+
     account, session = register_and_login(client, "security")
     def rotate_once(_index: int):
-        return client.post("/api/auth/refresh", json={"refresh_token": session["refresh_token"]})
+        return client.post("/api/auth/refresh", json={"refresh_token": session["_refresh_cookie"]})
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         rotations = list(pool.map(rotate_once, range(2)))
     assert sorted(response.status_code for response in rotations) == [200, 401]
     new_session = next(response.json() for response in rotations if response.status_code == 200)
-    assert new_session["refresh_token"] != session["refresh_token"]
-    assert client.post("/api/auth/refresh", json={"refresh_token": session["refresh_token"]}).status_code == 401
+    assert "refresh_token" not in new_session
+    assert client.post("/api/auth/refresh", json={"refresh_token": session["_refresh_cookie"]}).status_code == 401
     forgot = client.post("/api/auth/password/forgot", json={"identity": account["username"]})
     assert forgot.status_code == 200
     reset = client.post("/api/auth/password/reset", json={
@@ -422,11 +438,51 @@ def platform_scenario(client: TestClient) -> None:
         f"/api/platform/remote/runner/jobs/claim?runner_id={runner_id}", headers=runner_auth,
     ).json()["job"]
     assert claimed["id"] == job.json()["job_id"]
+    first_lease = claimed["lease_token"]
+    with SessionLocal() as db:
+        row = db.query(RemoteJobRecord).filter(RemoteJobRecord.id == claimed["id"]).one()
+        row.lease_expires_at = datetime(2000, 1, 1)
+        db.commit()
+    reclaimed = client.post(
+        f"/api/platform/remote/runner/jobs/claim?runner_id={runner_id}", headers=runner_auth,
+    ).json()["job"]
+    assert reclaimed["attempt"] == 2 and reclaimed["lease_token"] != first_lease
+    stale_lease = client.post(
+        f"/api/platform/remote/runner/jobs/{claimed['id']}/heartbeat", headers=runner_auth,
+        json={"runner_id": runner_id, "lease_token": first_lease},
+    )
+    assert stale_lease.status_code == 404
+    claimed = reclaimed
+    lease = client.post(
+        f"/api/platform/remote/runner/jobs/{claimed['id']}/heartbeat", headers=runner_auth,
+        json={"runner_id": runner_id, "lease_token": claimed["lease_token"]},
+    )
+    assert lease.status_code == 200 and lease.json()["action"] == "continue"
     completed = client.post(
         f"/api/platform/remote/runner/jobs/{claimed['id']}/complete",
-        headers=runner_auth, json={"output": "Python 3", "exit_code": 0},
+        headers=runner_auth, json={
+            "runner_id": runner_id, "lease_token": claimed["lease_token"],
+            "output": "Python 3", "exit_code": 0,
+        },
     )
     assert completed.status_code == 200 and completed.json()["status"] == "completed"
+    exhausted_job = client.post("/api/platform/remote/jobs", headers=auth, json={
+        "runner_id": runner_id, "argv": ["python", "-V"], "timeout": 30,
+    }).json()["job_id"]
+    exhausted_claim = client.post(
+        f"/api/platform/remote/runner/jobs/claim?runner_id={runner_id}", headers=runner_auth,
+    ).json()["job"]
+    assert exhausted_claim["id"] == exhausted_job
+    with SessionLocal() as db:
+        row = db.query(RemoteJobRecord).filter(RemoteJobRecord.id == exhausted_job).one()
+        row.attempts = get_settings().remote_job_max_attempts
+        row.lease_expires_at = datetime(2000, 1, 1)
+        db.commit()
+    assert client.post(
+        f"/api/platform/remote/runner/jobs/claim?runner_id={runner_id}", headers=runner_auth,
+    ).json()["job"] is None
+    remote_rows = client.get("/api/platform/remote/jobs", headers=auth).json()
+    assert next(item for item in remote_rows if item["id"] == exhausted_job)["status"] == "failed"
     assert client.delete(f"/api/platform/notification-endpoints/{endpoint.json()['id']}", headers=auth).status_code == 200
 
 

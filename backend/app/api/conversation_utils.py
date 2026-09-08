@@ -15,10 +15,6 @@ from ..platform.services.conversations import (
 from ..platform.ports import WorkspaceHandle
 
 
-# Compatibility alias backed by the single bootstrap-owned instance.
-workspace_manager = get_container().workspace_manager
-
-
 def get_or_create_conversation(
     db: Session,
     user_id: int,

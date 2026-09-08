@@ -8,7 +8,9 @@ from typing import Any
 
 from app.agent_runtime import Tool
 from app.extensions.builtin.workspace import WorkspaceEditor
-from .skills import skill_runtime
+from app.platform.services.lazy import LazyService
+
+from .skills import ProjectSkillRuntime
 
 
 @dataclass
@@ -24,6 +26,9 @@ class ProjectContextLoader:
     MAX_CONTEXT_CHARS = 24_000
     MAX_SKILLS = 12
     MAX_EXTENSIONS = 20
+
+    def __init__(self, skills: ProjectSkillRuntime | None = None) -> None:
+        self.skills = skills or ProjectSkillRuntime()
 
     def load(self, workspace: WorkspaceEditor, *, trusted: bool) -> ProjectContextBundle:
         root = workspace.root.resolve()
@@ -42,16 +47,16 @@ class ProjectContextLoader:
         if isinstance(settings, dict) and str(settings.get("instructions") or "").strip():
             sections.append("Project settings instructions:\n" + str(settings["instructions"]).strip())
 
-        skills = skill_runtime.discover(workspace)
+        skills = self.skills.discover(workspace)
         enabled_skills = set(settings.get("enabled_skills") or []) if isinstance(settings, dict) else set()
         if enabled_skills:
             skills = [item for item in skills if item.name in enabled_skills]
-        catalog = skill_runtime.catalog_text(skills[: self.MAX_SKILLS])
+        catalog = self.skills.catalog_text(skills[: self.MAX_SKILLS])
         if catalog:
             sections.append(catalog)
 
         tools = self._load_extensions(root, workspace, settings)
-        tools.extend(skill_runtime.tools(workspace, skills[: self.MAX_SKILLS]))
+        tools.extend(self.skills.tools(workspace, skills[: self.MAX_SKILLS]))
         text = "\n\n".join(sections)
         if len(text) > self.MAX_CONTEXT_CHARS:
             text = text[: self.MAX_CONTEXT_CHARS] + "\n[project context truncated]"
@@ -145,4 +150,4 @@ class ProjectContextLoader:
         return None
 
 
-project_context_loader = ProjectContextLoader()
+project_context_loader = LazyService(ProjectContextLoader)

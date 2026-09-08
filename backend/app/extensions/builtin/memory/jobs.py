@@ -8,13 +8,16 @@ from app.infra.config import get_settings
 from app.platform.database import MemoryExtractionJob, SessionLocal
 from .service import memory_service
 from app.platform.services.task_runtime import runtime_task_manager
+from app.platform.services.lazy import LazyService
+from app.providers import ModelProvider
 
 
 class DurableMemoryJobQueue:
     """Post-response memory enrichment queue; model latency is off the answer path."""
 
-    def __init__(self) -> None:
-        self.settings = get_settings()
+    def __init__(self, settings=None, *, memory=None) -> None:
+        self.settings = settings or get_settings()
+        self.memory = memory or memory_service
         self._redis = None
         self._retry_after = 0.0
 
@@ -29,7 +32,7 @@ class DurableMemoryJobQueue:
         assistant_text: str,
         project_identity: str | None,
     ) -> str | None:
-        settings = memory_service.get_settings(user_id)
+        settings = self.memory.get_settings(user_id)
         if not settings["enabled"] or not settings["auto_capture"]:
             return None
         job_id = uuid.uuid4().hex
@@ -122,7 +125,20 @@ class DurableMemoryJobQueue:
         self._retry_after = time.monotonic() + 5
 
 
-async def execute_memory_job(job_id: str) -> bool:
+async def execute_memory_job(
+    job_id: str,
+    *,
+    memory=None,
+    tasks=None,
+    queue: DurableMemoryJobQueue | None = None,
+    chat_provider: ModelProvider | None = None,
+    coding_provider: ModelProvider | None = None,
+    settings=None,
+) -> bool:
+    memory = memory or memory_service
+    tasks = tasks or runtime_task_manager
+    queue = queue or memory_job_queue
+    settings = settings or get_settings()
     with SessionLocal() as db:
         updated = db.query(MemoryExtractionJob).filter(
             MemoryExtractionJob.id == job_id,
@@ -151,16 +167,18 @@ async def execute_memory_job(job_id: str) -> bool:
             "attempts": job.attempts,
         }
     try:
-        from ...services import get_chat_model_provider, get_coding_model_provider
-
-        settings = get_settings()
         coding = snapshot["mode"] == "coding-agent"
-        provider = get_coding_model_provider() if coding else get_chat_model_provider()
+        if coding_provider is None or chat_provider is None:
+            from ...services import get_chat_model_provider, get_coding_model_provider
+
+            provider = get_coding_model_provider() if coding else get_chat_model_provider()
+        else:
+            provider = coding_provider if coding else chat_provider
         model = (
             settings.coding_model_id if coding else settings.chat_model_id
         ) or getattr(provider, "default_model", "") or settings.deepseek_model
         memories, usage = await asyncio.wait_for(
-            memory_service.auto_extract(
+            memory.auto_extract(
                 provider=provider,
                 model=model,
                 user_id=snapshot["user_id"],
@@ -172,14 +190,14 @@ async def execute_memory_job(job_id: str) -> bool:
             ),
             timeout=min(30.0, max(5.0, settings.model_request_timeout_seconds)),
         )
-        runtime_task_manager.record_usage(
+        tasks.record_usage(
             snapshot["task_id"],
             str(getattr(provider, "provider_name", type(provider).__name__)),
             model,
             usage,
         )
         if memories:
-            runtime_task_manager.append_event(snapshot["task_id"], "memory_updated", {
+            tasks.append_event(snapshot["task_id"], "memory_updated", {
                 "count": len(memories),
                 "memories": [
                     {"id": item["id"], "scope": item["scope"], "key": item["key"]}
@@ -201,13 +219,13 @@ async def execute_memory_job(job_id: str) -> bool:
                 row.status = "queued" if row.attempts < 3 else "failed"
                 db.commit()
                 if row.status == "queued":
-                    client = memory_job_queue._client()
+                    client = queue._client()
                     if client:
                         try:
-                            client.rpush(memory_job_queue.settings.memory_job_queue_name, job_id)
+                            client.rpush(queue.settings.memory_job_queue_name, job_id)
                         except Exception:
-                            memory_job_queue._failed()
+                            queue._failed()
         return False
 
 
-memory_job_queue = DurableMemoryJobQueue()
+memory_job_queue = LazyService(DurableMemoryJobQueue)

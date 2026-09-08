@@ -14,15 +14,16 @@ from .lsp import LspUnavailable, lsp_manager
 class WorkspaceLanguageService:
     """Workspace-scoped language intelligence used by Monaco providers."""
 
-    def __init__(self, root: str | Path) -> None:
+    def __init__(self, root: str | Path, *, manager=None) -> None:
         self.root = Path(root).resolve()
+        self.manager = manager or lsp_manager
 
     def complete(self, path: str, content: str, line: int, column: int) -> list[dict]:
         target = self._resolve(path)
         if target.suffix.lower() != ".py":
             return []
         try:
-            items = lsp_manager.session(self.root).completion(path, content, line, column)
+            items = self.manager.session(self.root).completion(path, content, line, column)
             if items:
                 return items
         except (LspUnavailable, OSError, TimeoutError, ValueError):
@@ -51,7 +52,7 @@ class WorkspaceLanguageService:
             return []
         lsp_items: list[dict] = []
         try:
-            lsp_items = lsp_manager.session(self.root).diagnostics(path, content)
+            lsp_items = self.manager.session(self.root).diagnostics(path, content)
         except (LspUnavailable, OSError, TimeoutError, ValueError):
             pass
         command = self._ruff_command()
@@ -129,7 +130,7 @@ class WorkspaceLanguageService:
         if target.suffix.lower() != ".py":
             return []
         try:
-            items = lsp_manager.session(self.root).definition(path, content, line, column)
+            items = self.manager.session(self.root).definition(path, content, line, column)
             if items:
                 return items
         except (LspUnavailable, OSError, TimeoutError, ValueError):
@@ -164,15 +165,15 @@ class WorkspaceLanguageService:
 
     def hover(self, path: str, content: str, line: int, column: int) -> dict | None:
         self._resolve(path)
-        return lsp_manager.session(self.root).hover(path, content, line, column)
+        return self.manager.session(self.root).hover(path, content, line, column)
 
     def references(self, path: str, content: str, line: int, column: int) -> list[dict]:
         self._resolve(path)
-        return lsp_manager.session(self.root).references(path, content, line, column)
+        return self.manager.session(self.root).references(path, content, line, column)
 
     def rename(self, path: str, content: str, line: int, column: int, new_name: str) -> list[dict]:
         self._resolve(path)
-        return lsp_manager.session(self.root).rename(path, content, line, column, new_name)
+        return self.manager.session(self.root).rename(path, content, line, column, new_name)
 
     def _resolve(self, path: str) -> Path:
         if not path or "\x00" in path:

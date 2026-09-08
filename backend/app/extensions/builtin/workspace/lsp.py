@@ -9,6 +9,8 @@ import threading
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+from app.platform.services.lazy import LazyService
+
 
 class LspUnavailable(RuntimeError):
     pass
@@ -329,4 +331,4 @@ class WorkspaceLspManager:
             session.close()
 
 
-lsp_manager = WorkspaceLspManager()
+lsp_manager = LazyService(WorkspaceLspManager)

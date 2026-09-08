@@ -17,11 +17,11 @@ class LoginRequest(BaseModel):
 
 
 class RefreshTokenRequest(BaseModel):
-    refresh_token: str = Field(min_length=32, max_length=500)
+    refresh_token: str | None = Field(default=None, min_length=32, max_length=500)
 
 
 class LogoutRequest(BaseModel):
-    refresh_token: str = Field(min_length=32, max_length=500)
+    refresh_token: str | None = Field(default=None, min_length=32, max_length=500)
 
 
 class PasswordForgotRequest(BaseModel):
@@ -231,5 +231,12 @@ class RemoteJobCreateRequest(BaseModel):
 
 
 class RemoteJobCompleteRequest(BaseModel):
+    runner_id: str = Field(min_length=32, max_length=32)
+    lease_token: str = Field(min_length=32, max_length=64)
     output: str = Field(default="", max_length=2_000_000)
     exit_code: int
+
+
+class RemoteJobLeaseRequest(BaseModel):
+    runner_id: str = Field(min_length=32, max_length=32)
+    lease_token: str = Field(min_length=32, max_length=64)

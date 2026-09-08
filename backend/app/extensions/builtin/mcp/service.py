@@ -15,6 +15,7 @@ import httpx
 from app.infra.config import get_settings
 from app.agent_runtime import Tool
 from app.extensions.builtin.workspace import WorkspaceEditor
+from app.platform.services.lazy import LazyService
 
 
 @dataclass(frozen=True)
@@ -309,4 +310,4 @@ class MCPClientRuntime:
         return re.sub(r"\$\{([A-Z_][A-Z0-9_]*)\}", lambda match: os.getenv(match.group(1), ""), value)
 
 
-mcp_client_runtime = MCPClientRuntime()
+mcp_client_runtime = LazyService(MCPClientRuntime)

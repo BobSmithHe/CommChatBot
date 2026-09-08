@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.agent_runtime import Tool
+from app.platform.services.lazy import LazyService
 from app.extensions.builtin.workspace import WorkspaceEditor
 
 
@@ -184,4 +185,4 @@ class ProjectSkillRuntime:
         return name, description
 
 
-skill_runtime = ProjectSkillRuntime()
+skill_runtime = LazyService(ProjectSkillRuntime)

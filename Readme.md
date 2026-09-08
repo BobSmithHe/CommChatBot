@@ -4,6 +4,8 @@ CommChatBot 是一个同时提供 **Chat** 与 **Coding Agent** 两种模式的�
 
 项目当前版本为 `0.8.0`，前端使用 Vue 3、Vite、Monaco Editor 与 xterm.js，后端使用 FastAPI、SQLAlchemy、MySQL、Redis 和 Milvus。
 
+完整功能、实现机制、默认容量参数和实测指标见 [功能与指标总览](docs/FUNCTIONS_AND_METRICS.md)。
+
 ## 核心能力
 
 ### Chat 模式
@@ -36,7 +38,7 @@ CommChatBot 是一个同时提供 **Chat** 与 **Coding Agent** 两种模式的�
 - 支持串行/并行工具、JSON Schema 参数校验和结构化进度事件。
 - 支持 `SessionStart`、`PreToolUse`、`PermissionRequest`、`PostToolUse`、`Stop` Hook。
 - durable steering/follow-up 消息队列，可在安全的 turn 边界追加任务指令。
-- Redis Streams 实时事件总线与短周期批量数据库落盘；Redis 故障时自动回退到数据库事件流。
+- Redis Streams 实时事件总线与短周期批量数据库落盘；本地 SQLite outbox 在数据库短暂故障或进程重启后自动重放，Redis 故障时客户端回退到数据库事件流。
 - 子 Agent 任务拥有持久化父子关系、状态、进度和结果，运行中与重新打开会话后均可查看。
 - 取消任务和终端 Ctrl+C 使用不同协议，避免 cancelled 与 500 error 同时出现。
 
@@ -55,9 +57,10 @@ CommChatBot 是一个同时提供 **Chat** 与 **Coding Agent** 两种模式的�
 
 ### 安全与可观测性
 
-- 短期访问令牌和一次性轮换 Refresh Token。
+- 短期访问令牌和一次性轮换 Refresh Token；Refresh Token 只保存在限定路径的 HttpOnly Cookie，旧版 localStorage 凭据会被一次性迁移并删除。
 - 注册、登录和密码重置限流，以及登录审计。
 - 密码重置会撤销旧 Refresh Session。
+- API 返回安全响应头和可追踪的 `X-Request-ID`；认证响应禁止缓存。
 - Docker 沙箱以非 root 用户运行，默认无网络、只读根文件系统、仅挂载工作区，并限制 CPU、内存、进程数和输出量。
 - Langfuse 记录任务事件；Token、缓存 Token 和成本统计按任务与会话持久化。
 - 项目级 `AGENTS.md`、`SKILL.md` 和声明式扩展需要显式信任，不会作为服务端 Python 代码直接加载。
@@ -68,7 +71,7 @@ CommChatBot 是一个同时提供 **Chat** 与 **Coding Agent** 两种模式的�
 - Skill Runtime 采用渐进加载：上下文只注入名称与描述，Agent 按需读取完整 `SKILL.md`、资源文件，并经现有沙箱与审批执行 `scripts/`。
 - GitHub 工具支持 PR 列表、创建 PR、Check Runs、整单及行级 Review；签名 Webhook 可把订阅仓库事件写入通知与外部投递队列；仓库自带 GitHub Actions 后端/前端 CI。
 - 定时任务复用耐久 Agent 队列，兼容固定间隔和带 IANA 时区的 RFC 5545 RRULE；通知持久化在应用内，并可通过签名 Webhook 或 SMTP 邮件异步重试投递。
-- 远程 Runner 使用心跳、拉取、完成回报协议；参考 Runner 默认在无网络且有 CPU/内存/PID 限制的 Docker 容器内执行，服务端默认拒绝未声明隔离能力的 Runner。
+- 远程 Runner 使用带租约令牌的心跳、拉取、续租、取消和完成回报协议；Runner 崩溃后过期任务可重新领取，旧租约不能覆盖新执行结果。参考 Runner 默认在无网络且有 CPU/内存/PID 限制的 Docker 容器内执行。
 
 ## 架构
 
@@ -303,9 +306,11 @@ python scripts/agent_eval.py evals/smoke.jsonl
 
 当前基线：
 
-- 后端：`103 passed`
+- 后端：`114 passed`
 - 前端生产构建：通过
 - Playwright E2E：`12 passed`，另有 `1` 个连接真实 API 的测试按需运行
+
+CI 还会实际启动 FastAPI 与 Vite，运行真实浏览器全链路测试，并以失败数、RPS 和 P95 延迟作为健康接口的并发性能门槛。
 
 测试覆盖流式响应、工具调用、并行失败、审批拒绝、取消、checkpoint 恢复、终端退出码/超时/Ctrl+C/Ctrl+Z、输出 cursor、Docker 终端、会话切换、Refresh Token、编辑器标签和记忆管理。
 
@@ -323,6 +328,7 @@ python scripts/agent_eval.py evals/smoke.jsonl
 - `/api/platform/remote/*`：远程 Runner 心跳、任务拉取和结果回报协议。
 - `/api/auth/*`：登录、刷新、登出、密码重置和审计。
 - `GET /api/models`：可用 Provider/模型目录，不返回密钥。
+- `GET /health` / `GET /health/ready`：进程存活与数据库就绪探针。
 
 更多后端细节见 [backend/README.md](backend/README.md)。
 
@@ -334,7 +340,7 @@ python scripts/agent_eval.py evals/smoke.jsonl
 - MCP server 进程与远程 Runner 都是外部资源；checkpoint 会保留 Agent/文件状态，但不会把进程内协议会话或 shell 状态持久化，重启后会按配置新建连接。
 - 外部通知内置通用 Webhook 与 SMTP Email；移动系统原生推送尚需经 Webhook 接入第三方网关。
 - 远程 Runner 保证命令执行隔离，但当前不自动复制本地未提交文件；远端工作目录应由部署系统预置或从 Git 同步。
-- 生产环境应额外启用数据库磁盘/备份加密、反向代理 TLS，并关闭 `PASSWORD_RESET_DEBUG` 与匿名访问。
+- 生产环境应额外启用数据库磁盘/备份加密和反向代理 TLS。设置 `APP_ENVIRONMENT=production` 后，后端会拒绝弱 JWT 密钥、不安全 Refresh Cookie、调试密码重置或通配 CORS 配置。
 
 ## License
 

@@ -19,6 +19,7 @@ from app.extensions.support.sandbox import (
     sandbox_environment,
 )
 from app.infra.config import get_settings
+from app.platform.services.lazy import LazyService
 
 
 MAX_OUTPUT_CHARS = 200_000
@@ -550,4 +551,4 @@ class WorkspaceTerminalManager:
         return session
 
 
-terminal_manager = WorkspaceTerminalManager()
+terminal_manager = LazyService(WorkspaceTerminalManager)

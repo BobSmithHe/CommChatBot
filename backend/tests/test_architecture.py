@@ -86,3 +86,56 @@ def test_profiles_select_capabilities_without_cross_mode_leaks() -> None:
     assert chat == {"chat.rag", "chat.web-search", "chat.memory"}
     assert {"coding.workspace", "coding.diagnostics", "coding.git", "coding.terminal"} <= coding
     assert chat.isdisjoint(coding)
+
+
+def test_production_entrypoints_do_not_import_legacy_service_singletons() -> None:
+    singleton_names = {
+        "runtime_task_manager", "task_queue", "event_bus", "event_batch_writer",
+        "memory_service", "memory_job_queue", "terminal_manager", "lsp_manager",
+        "notification_dispatcher", "auth_rate_limiter", "hook_runner",
+        "mcp_client_runtime", "github_integration", "remote_execution_service",
+    }
+    roots = [APP_ROOT / "bootstrap", APP_ROOT / "api", APP_ROOT / "main.py", APP_ROOT / "worker.py"]
+    violations = []
+    paths = []
+    for root in roots:
+        paths.extend(root.rglob("*.py") if root.is_dir() else [root])
+    for path in paths:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                imported = singleton_names.intersection(item.name for item in node.names)
+                if imported:
+                    violations.append(f"{path.relative_to(APP_ROOT)}: {sorted(imported)}")
+    assert violations == []
+
+
+def test_legacy_service_exports_are_lazy_compatibility_proxies() -> None:
+    singleton_names = {
+        "runtime_task_manager", "task_queue", "event_bus", "event_batch_writer",
+        "memory_service", "memory_job_queue", "terminal_manager", "lsp_manager",
+        "notification_dispatcher", "auth_rate_limiter", "hook_runner", "context_manager",
+        "mcp_client_runtime", "github_integration", "remote_execution_service",
+        "project_context_loader", "skill_runtime",
+    }
+    eager = []
+    discovered = set()
+    for path in APP_ROOT.rglob("*.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            names = {target.id for target in targets if isinstance(target, ast.Name)} & singleton_names
+            if not names:
+                continue
+            discovered.update(names)
+            value = node.value
+            if not (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and value.func.id == "LazyService"
+            ):
+                eager.append(f"{path.relative_to(APP_ROOT)}: {sorted(names)}")
+    assert discovered == singleton_names
+    assert eager == []

@@ -5,7 +5,7 @@ import json
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from ...platform.services.task_runtime import runtime_task_manager
+from ...bootstrap import get_container
 from ...platform.database import (
     AgentSubtaskRecord,
     AgentTask,
@@ -145,7 +145,7 @@ def enqueue_subtask_message(
     user: User = Depends(current_user), db: Session = Depends(get_db),
 ) -> dict:
     _require_task(db, user.id, task_id)
-    queued = runtime_task_manager.enqueue_subtask_message(task_id, subtask_id, req.kind, req.content)
+    queued = get_container().task_manager.enqueue_subtask_message(task_id, subtask_id, req.kind, req.content)
     if not queued:
         raise HTTPException(status_code=409, detail="Sub-agent is not accepting messages")
     return {"status": "queued", "agent_id": subtask_id, **queued}
@@ -157,7 +157,7 @@ def interrupt_subtask(
     user: User = Depends(current_user), db: Session = Depends(get_db),
 ) -> dict:
     _require_task(db, user.id, task_id)
-    if not runtime_task_manager.cancel_subtask(task_id, subtask_id):
+    if not get_container().task_manager.cancel_subtask(task_id, subtask_id):
         raise HTTPException(status_code=404, detail="Sub-agent not found")
     return {"id": subtask_id, "status": "cancelled"}
 
@@ -170,17 +170,18 @@ def enqueue_task_message(
     db: Session = Depends(get_db),
 ) -> dict:
     _require_task(db, user.id, task_id)
-    queued = runtime_task_manager.enqueue_message(task_id, req.kind, req.content)
+    tasks = get_container().task_manager
+    queued = tasks.enqueue_message(task_id, req.kind, req.content)
     if not queued:
         raise HTTPException(status_code=409, detail="Task is not accepting queued messages")
-    runtime_task_manager.append_event(task_id, "message_queued", {"id": queued["id"], "kind": queued["kind"]})
+    tasks.append_event(task_id, "message_queued", {"id": queued["id"], "kind": queued["kind"]})
     return {"status": "queued", **queued}
 
 
 @router.post("/{task_id}/cancel")
 async def cancel_task(task_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
     _require_task(db, user.id, task_id)
-    return {"status": "cancelled" if runtime_task_manager.cancel(task_id) else "not-running"}
+    return {"status": "cancelled" if get_container().task_manager.cancel(task_id) else "not-running"}
 
 
 @router.post("/{task_id}/resume")
@@ -214,6 +215,6 @@ async def resolve_approval(
     ).first()
     if not approval:
         raise HTTPException(status_code=404, detail="Approval request not found")
-    if not runtime_task_manager.resolve_approval(approval_id, req.approved):
+    if not get_container().task_manager.resolve_approval(approval_id, req.approved):
         raise HTTPException(status_code=409, detail="Approval request is no longer pending")
     return {"status": "approved" if req.approved else "rejected"}

@@ -16,6 +16,7 @@ from ..database import (
     RefreshTokenRecord,
     User,
 )
+from .lazy import LazyService
 from ...infra.security import create_access_token, hash_password
 
 
@@ -26,8 +27,8 @@ class AuthRateLimitError(RuntimeError):
 
 
 class AuthRateLimiter:
-    def __init__(self) -> None:
-        self.settings = get_settings()
+    def __init__(self, settings=None) -> None:
+        self.settings = settings or get_settings()
         self._memory: dict[str, tuple[int, float]] = {}
         self._lock = threading.Lock()
         self._redis = None
@@ -222,4 +223,4 @@ def audit_auth(
     db.commit()
 
 
-auth_rate_limiter = AuthRateLimiter()
+auth_rate_limiter = LazyService(AuthRateLimiter)

@@ -19,7 +19,6 @@ test.describe("live full-stack", () => {
     }
     await page.addInitScript((tokens) => {
       localStorage.setItem("commchatbot.access_token", tokens.access_token);
-      localStorage.setItem("commchatbot.refresh_token", tokens.refresh_token);
     }, session);
     await page.goto("/");
     await expect(page.locator("body")).toContainText("CommChatBot");

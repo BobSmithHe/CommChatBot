@@ -484,15 +484,15 @@ import {
   Pencil, SendHorizontal, ShieldCheck, Sparkles, Square, Trash2, UserRound, X,
 } from "lucide-vue-next";
 import {
-  apiDelete, apiGet, apiPatch, apiPost, clearAuthSession, getRefreshToken, setAuthSession,
+  apiDelete, apiGet, apiPatch, apiPost, clearAuthSession, setAuthSession,
   streamChat, uploadFile,
 } from "./api/client";
-import WorkspaceTreeNode from "./components/WorkspaceTreeNode.vue";
-import TerminalView from "./components/TerminalView.vue";
 import AgentTurn from "./components/AgentTurn.vue";
 import { renderMarkdown } from "./utils/markdown";
 
 const MonacoEditor = defineAsyncComponent(() => import("./components/MonacoEditor.vue"));
+const TerminalView = defineAsyncComponent(() => import("./components/TerminalView.vue"));
+const WorkspaceTreeNode = defineAsyncComponent(() => import("./components/WorkspaceTreeNode.vue"));
 
 const mode = ref("chatbot");
 const useRag = ref(true);
@@ -728,13 +728,10 @@ async function submitAuth() {
 
 async function logout() {
   if (conversationRuns.size) return;
-  const refreshToken = getRefreshToken();
-  if (refreshToken) {
-    try {
-      await apiPost("/api/auth/logout", { refresh_token: refreshToken });
-    } catch {
-      // Local session must still be cleared if the server is unavailable.
-    }
+  try {
+    await apiPost("/api/auth/logout", {});
+  } catch {
+    // Local session must still be cleared if the server is unavailable.
   }
   clearAuthSession();
   if (await loadCurrentUser()) await reloadIdentityScope();

@@ -20,6 +20,7 @@ from ..database import (
     NotificationRecord,
     SessionLocal,
 )
+from .lazy import LazyService
 
 
 def validate_endpoint(kind: str, target: str) -> str:
@@ -58,6 +59,9 @@ def enqueue_notification_deliveries(db, notification: NotificationRecord) -> int
 
 class NotificationDispatcher:
     """Durable webhook/email outbox with bounded exponential retry."""
+
+    def __init__(self, settings=None) -> None:
+        self.settings = settings or get_settings()
 
     async def tick(self) -> int:
         now = datetime.utcnow()
@@ -127,7 +131,7 @@ class NotificationDispatcher:
             with SessionLocal() as db:
                 row = db.query(NotificationDeliveryRecord).filter(NotificationDeliveryRecord.id == delivery_id).first()
                 if row:
-                    maximum = max(1, get_settings().notification_max_attempts)
+                    maximum = max(1, self.settings.notification_max_attempts)
                     row.status = "failed" if row.attempts >= maximum else "retry"
                     row.next_attempt_at = datetime.utcnow() + timedelta(seconds=min(3600, 2 ** row.attempts * 5))
                     row.last_error = f"{type(exc).__name__}: {exc}"[:2000]
@@ -174,7 +178,7 @@ class NotificationDispatcher:
     async def run(self) -> None:
         while True:
             await self.tick()
-            await asyncio.sleep(max(0.5, get_settings().notification_poll_seconds))
+            await asyncio.sleep(max(0.5, self.settings.notification_poll_seconds))
 
 
-notification_dispatcher = NotificationDispatcher()
+notification_dispatcher = LazyService(NotificationDispatcher)

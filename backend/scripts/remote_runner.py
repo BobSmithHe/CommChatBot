@@ -10,6 +10,7 @@ import os
 import platform
 import shutil
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -59,26 +60,72 @@ def main() -> None:
                     continue
                 try:
                     command = job["argv"]
+                    container_name = ""
                     if args.mode == "docker":
+                        container_name = f"commchat-runner-{job['id']}"
                         command = [
-                            "docker", "run", "--rm", "--init", "--network", args.network,
+                            "docker", "run", "--rm", "--init", "--name", container_name,
+                            "--network", args.network,
                             "--memory", args.memory, "--cpus", args.cpus,
                             "--pids-limit", str(max(16, args.pids_limit)),
                             "-v", f"{workdir}:/workspace", "-w", "/workspace",
                             args.image, *job["argv"],
                         ]
-                    completed = subprocess.run(
-                        command, cwd=str(workdir), capture_output=True, text=True,
-                        timeout=max(1, min(int(job.get("timeout", 300)), 3600)), shell=False,
-                    )
-                    output = (completed.stdout or "") + (completed.stderr or "")
-                    exit_code = completed.returncode
-                except subprocess.TimeoutExpired as exc:
-                    output = f"Remote command timed out\n{exc.stdout or ''}{exc.stderr or ''}"
+                    timeout = max(1, min(int(job.get("timeout", 300)), 3600))
+                    deadline = time.monotonic() + timeout
+                    next_heartbeat = time.monotonic() + 10
+                    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace") as output_file:
+                        process = subprocess.Popen(
+                            command, cwd=str(workdir), stdout=output_file, stderr=subprocess.STDOUT,
+                            text=True, shell=False,
+                        )
+                        cancelled = False
+                        timed_out = False
+                        while process.poll() is None:
+                            now = time.monotonic()
+                            if now >= deadline:
+                                timed_out = True
+                                break
+                            if now >= next_heartbeat:
+                                lease = client.post(
+                                    f"/api/platform/remote/runner/jobs/{job['id']}/heartbeat",
+                                    json={"runner_id": runner_id, "lease_token": job["lease_token"]},
+                                )
+                                lease.raise_for_status()
+                                if lease.json().get("action") == "cancel":
+                                    cancelled = True
+                                    break
+                                next_heartbeat = now + 10
+                            time.sleep(0.25)
+                        if process.poll() is None:
+                            if container_name:
+                                subprocess.run(
+                                    ["docker", "stop", "-t", "2", container_name],
+                                    capture_output=True, timeout=10, check=False,
+                                )
+                            else:
+                                process.terminate()
+                            try:
+                                process.wait(timeout=5)
+                            except subprocess.TimeoutExpired:
+                                process.kill()
+                                process.wait(timeout=5)
+                        output_file.seek(0)
+                        output = output_file.read()
+                        exit_code = process.returncode if not (cancelled or timed_out) else -1
+                        if cancelled:
+                            output = "Remote command cancelled\n" + output
+                        elif timed_out:
+                            output = "Remote command timed out\n" + output
+                except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                    output = f"Remote runner failed to start or monitor command: {type(exc).__name__}: {exc}"
                     exit_code = -1
                 client.post(
                     f"/api/platform/remote/runner/jobs/{job['id']}/complete",
-                    json={"output": output[-2_000_000:], "exit_code": exit_code},
+                    json={
+                        "runner_id": runner_id, "lease_token": job["lease_token"],
+                        "output": output[-2_000_000:], "exit_code": exit_code,
+                    },
                 ).raise_for_status()
             except (httpx.HTTPError, OSError, KeyError, ValueError) as exc:
                 print(f"runner retry: {type(exc).__name__}: {exc}", flush=True)

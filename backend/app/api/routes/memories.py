@@ -5,7 +5,8 @@ from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
-from ...extensions.builtin.memory import MEMORY_SCOPES, MemoryTarget, memory_service
+from ...bootstrap import get_container
+from ...extensions.builtin.memory import MEMORY_SCOPES, MemoryTarget
 from ...platform.database import AgentTask, Conversation, User, get_db
 from ..conversation_utils import ensure_conversation_workspace
 from ..deps import current_user
@@ -15,9 +16,13 @@ from ..schemas import MemoryCreateRequest, MemorySettingsRequest, MemoryUpdateRe
 router = APIRouter(prefix="/api/memories", tags=["memories"])
 
 
+def _memory():
+    return get_container().memory_service
+
+
 @router.get("/settings")
 def memory_settings(user: User = Depends(current_user)) -> dict:
-    return memory_service.get_settings(user.id)
+    return _memory().get_settings(user.id)
 
 
 @router.patch("/settings")
@@ -25,7 +30,7 @@ def update_memory_settings(
     req: MemorySettingsRequest,
     user: User = Depends(current_user),
 ) -> dict:
-    return memory_service.update_settings(user.id, req.model_dump(exclude_none=True))
+    return _memory().update_settings(user.id, req.model_dump(exclude_none=True))
 
 
 @router.get("")
@@ -43,7 +48,7 @@ def list_memories(
         raise HTTPException(status_code=400, detail="Invalid memory scope")
     target_id = None
     if scope == "user":
-        target_id = memory_service.target("user", user_id=user.id).target_id
+        target_id = _memory().target("user", user_id=user.id).target_id
     elif scope == "conversation" and conversation_id:
         target_id = _resolve_target(
             db, user.id, scope, conversation_id=conversation_id, task_id=task_id
@@ -57,7 +62,7 @@ def list_memories(
             db, user.id, scope, conversation_id=conversation_id, task_id=task_id
         ).target_id
     return {
-        "memories": memory_service.list(
+        "memories": _memory().list(
             user.id,
             scope=scope,
             target_id=target_id,
@@ -82,7 +87,7 @@ def recall_memories(
     if task_id:
         _task(db, user.id, task_id)
     return {
-        "memories": memory_service.recall(
+        "memories": _memory().recall(
             user_id=user.id,
             query=query,
             conversation_id=conversation_id,
@@ -107,7 +112,7 @@ def create_memory(
     )
     expires_at = datetime.utcnow() + timedelta(days=req.ttl_days) if req.ttl_days else None
     try:
-        return memory_service.upsert(
+        return _memory().upsert(
             user_id=user.id,
             target=target,
             key=req.key,
@@ -129,7 +134,7 @@ def update_memory(
     req: MemoryUpdateRequest,
     user: User = Depends(current_user),
 ) -> dict:
-    existing = memory_service.get(user.id, memory_id)
+    existing = _memory().get(user.id, memory_id)
     if not existing:
         raise HTTPException(status_code=404, detail="Memory not found")
     ttl_days = req.ttl_days
@@ -139,7 +144,7 @@ def update_memory(
         else (None if ttl_days == 0 else _parse_datetime(existing["expires_at"]))
     )
     try:
-        return memory_service.upsert(
+        return _memory().upsert(
             user_id=user.id,
             target=MemoryTarget(existing["scope"], existing["target_id"]),
             key=req.key or existing["key"],
@@ -165,12 +170,12 @@ def clear_memories(
 ) -> dict:
     if scope and scope not in MEMORY_SCOPES:
         raise HTTPException(status_code=400, detail="Invalid memory scope")
-    return {"deleted": memory_service.clear(user.id, scope)}
+    return {"deleted": _memory().clear(user.id, scope)}
 
 
 @router.delete("/{memory_id}")
 def delete_memory(memory_id: str, user: User = Depends(current_user)) -> dict:
-    if not memory_service.delete(user.id, memory_id):
+    if not _memory().delete(user.id, memory_id):
         raise HTTPException(status_code=404, detail="Memory not found")
     return {"status": "deleted"}
 
@@ -184,18 +189,18 @@ def _resolve_target(
     task_id: str | None,
 ) -> MemoryTarget:
     if scope == "user":
-        return memory_service.target("user", user_id=user_id)
+        return _memory().target("user", user_id=user_id)
     if scope == "conversation":
         conversation = _conversation(db, user_id, conversation_id)
-        return memory_service.target(scope, user_id=user_id, target_value=conversation.id)
+        return _memory().target(scope, user_id=user_id, target_value=conversation.id)
     if scope == "task":
         task = _task(db, user_id, task_id)
-        return memory_service.target(scope, user_id=user_id, target_value=task.id)
+        return _memory().target(scope, user_id=user_id, target_value=task.id)
     if scope == "project":
         identity = _project_identity(db, user_id, conversation_id)
         if not identity:
             raise HTTPException(status_code=400, detail="Project memory requires a Coding conversation")
-        return memory_service.target(scope, user_id=user_id, target_value=identity)
+        return _memory().target(scope, user_id=user_id, target_value=identity)
     raise HTTPException(status_code=400, detail="Invalid memory scope")
 
 

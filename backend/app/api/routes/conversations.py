@@ -10,18 +10,15 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ...platform.database import Conversation, Message, SessionLocal, User, ensure_anonymous_user, get_db
+from ...bootstrap import get_container
 from ...infra.config import get_settings
 from ...infra.security import decode_access_token
-from ...extensions.builtin.terminal.session import terminal_manager
-from ...extensions.builtin.workspace.language import WorkspaceLanguageService
-from ...extensions.builtin.project_context import project_context_loader
 from ...sse import sse
 from ..conversation_utils import (
     conversation_payload,
     ensure_conversation_workspace,
     message_payload,
     require_conversation,
-    workspace_manager,
 )
 from ..deps import current_user
 from ..schemas import (
@@ -47,13 +44,21 @@ from ..schemas import (
 router = APIRouter(prefix="/api/conversations", tags=["conversations"])
 
 
+def _workspace_manager():
+    return get_container().workspace_manager
+
+
+def _terminal_manager():
+    return get_container().terminal_manager
+
+
 @router.post("")
 def create_conversation(
     req: ConversationCreateRequest,
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    workspace_id = workspace_manager.create() if req.mode == "coding-agent" else None
+    workspace_id = _workspace_manager().create() if req.mode == "coding-agent" else None
     conv = Conversation(user_id=user.id, mode=req.mode, workspace_id=workspace_id, title="New Conversation")
     db.add(conv)
     db.commit()
@@ -128,7 +133,7 @@ def fork_conversation(
     workspace_id = None
     if source.mode == "coding-agent" and source.workspace_id:
         try:
-            workspace_id = workspace_manager.fork(source.workspace_id)
+            workspace_id = _workspace_manager().fork(source.workspace_id)
         except (ValueError, OSError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
     branch = Conversation(
@@ -225,7 +230,7 @@ def get_project_context_status(
     editor = ensure_conversation_workspace(db, conv)
     return {
         "project_trusted": bool(conv.project_trusted),
-        "discovered": project_context_loader.discover(editor.root),
+        "discovered": get_container().project_context_loader.discover(editor.root),
     }
 
 
@@ -269,15 +274,15 @@ def import_conversation_workspace(
     if conv.mode != "coding-agent":
         raise HTTPException(status_code=409, detail="Project import is only available in Coding Agent mode")
     try:
-        workspace_id = workspace_manager.import_workspace(req.source, req.kind, req.branch)
+        workspace_id = _workspace_manager().import_workspace(req.source, req.kind, req.branch)
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     previous = conv.workspace_id
     conv.workspace_id = workspace_id
     db.commit()
     if previous:
-        terminal_manager.close_workspace(previous)
-    editor = workspace_manager.editor(workspace_id)
+        _terminal_manager().close_workspace(previous)
+    editor = _workspace_manager().editor(workspace_id)
     return {"workspace_id": workspace_id, "entries": editor.list_entries(limit=1000)}
 
 
@@ -337,7 +342,7 @@ def workspace_completions(
     conv = require_conversation(db, user.id, conversation_id)
     editor = ensure_conversation_workspace(db, conv)
     try:
-        return {"items": WorkspaceLanguageService(editor.root).complete(req.path, req.content, req.line, req.column)}
+        return {"items": editor.language_service().complete(req.path, req.content, req.line, req.column)}
     except (ValueError, OSError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -352,7 +357,7 @@ def workspace_diagnostics(
     conv = require_conversation(db, user.id, conversation_id)
     editor = ensure_conversation_workspace(db, conv)
     try:
-        return {"items": WorkspaceLanguageService(editor.root).diagnostics(req.path, req.content)}
+        return {"items": editor.language_service().diagnostics(req.path, req.content)}
     except (ValueError, OSError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -367,7 +372,7 @@ def workspace_format(
     conv = require_conversation(db, user.id, conversation_id)
     editor = ensure_conversation_workspace(db, conv)
     try:
-        return {"content": WorkspaceLanguageService(editor.root).format(req.path, req.content)}
+        return {"content": editor.language_service().format(req.path, req.content)}
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -382,7 +387,7 @@ def workspace_definition(
     conv = require_conversation(db, user.id, conversation_id)
     editor = ensure_conversation_workspace(db, conv)
     try:
-        return {"items": WorkspaceLanguageService(editor.root).definition(req.path, req.content, req.line, req.column)}
+        return {"items": editor.language_service().definition(req.path, req.content, req.line, req.column)}
     except (ValueError, OSError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -397,7 +402,7 @@ def workspace_hover(
     conv = require_conversation(db, user.id, conversation_id)
     editor = ensure_conversation_workspace(db, conv)
     try:
-        return {"item": WorkspaceLanguageService(editor.root).hover(req.path, req.content, req.line, req.column)}
+        return {"item": editor.language_service().hover(req.path, req.content, req.line, req.column)}
     except (ValueError, OSError, TimeoutError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -412,7 +417,7 @@ def workspace_references(
     conv = require_conversation(db, user.id, conversation_id)
     editor = ensure_conversation_workspace(db, conv)
     try:
-        return {"items": WorkspaceLanguageService(editor.root).references(req.path, req.content, req.line, req.column)}
+        return {"items": editor.language_service().references(req.path, req.content, req.line, req.column)}
     except (ValueError, OSError, TimeoutError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -427,7 +432,7 @@ def workspace_rename(
     conv = require_conversation(db, user.id, conversation_id)
     editor = ensure_conversation_workspace(db, conv)
     try:
-        return {"items": WorkspaceLanguageService(editor.root).rename(
+        return {"items": editor.language_service().rename(
             req.path, req.content, req.line, req.column, req.new_name
         )}
     except (ValueError, OSError, TimeoutError) as exc:
@@ -612,7 +617,7 @@ def list_workspace_terminals(
 ) -> dict:
     conv = require_conversation(db, user.id, conversation_id)
     ensure_conversation_workspace(db, conv)
-    return {"terminals": terminal_manager.list(conv.workspace_id)}
+    return {"terminals": _terminal_manager().list(conv.workspace_id)}
 
 
 @router.post("/{conversation_id}/workspace/terminals")
@@ -623,7 +628,7 @@ def create_workspace_terminal(
 ) -> dict:
     conv = require_conversation(db, user.id, conversation_id)
     editor = ensure_conversation_workspace(db, conv)
-    return terminal_manager.create(conv.workspace_id, editor.root)
+    return _terminal_manager().create(conv.workspace_id, editor.root)
 
 
 @router.post("/{conversation_id}/workspace/terminals/{terminal_id}/execute")
@@ -637,7 +642,7 @@ def execute_terminal_command(
     conv = require_conversation(db, user.id, conversation_id)
     ensure_conversation_workspace(db, conv)
     try:
-        return terminal_manager.execute(conv.workspace_id, terminal_id, req.command)
+        return _terminal_manager().execute(conv.workspace_id, terminal_id, req.command)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -653,18 +658,18 @@ async def stream_terminal_command(
     conv = require_conversation(db, user.id, conversation_id)
     ensure_conversation_workspace(db, conv)
     try:
-        initial = terminal_manager.payload(conv.workspace_id, terminal_id)
+        initial = _terminal_manager().payload(conv.workspace_id, terminal_id)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     async def events():
         offset = len(initial.get("output", ""))
         future = asyncio.create_task(
-            asyncio.to_thread(terminal_manager.execute, conv.workspace_id, terminal_id, req.command)
+            asyncio.to_thread(_terminal_manager().execute, conv.workspace_id, terminal_id, req.command)
         )
         while not future.done():
             await asyncio.sleep(0.08)
-            current = terminal_manager.payload(conv.workspace_id, terminal_id)
+            current = _terminal_manager().payload(conv.workspace_id, terminal_id)
             output = current.get("output", "")
             if len(output) > offset:
                 yield sse("output", output[offset:])
@@ -692,7 +697,7 @@ def interrupt_terminal_command(
     conv = require_conversation(db, user.id, conversation_id)
     ensure_conversation_workspace(db, conv)
     try:
-        return {"status": "interrupted", "terminal": terminal_manager.interrupt(conv.workspace_id, terminal_id)}
+        return {"status": "interrupted", "terminal": _terminal_manager().interrupt(conv.workspace_id, terminal_id)}
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -726,13 +731,13 @@ async def terminal_websocket(websocket: WebSocket, conversation_id: int, termina
         workspace_id = conv.workspace_id
 
     try:
-        terminal_manager.resize(
+        _terminal_manager().resize(
             workspace_id,
             terminal_id,
             int(hello.get("cols") or 100),
             int(hello.get("rows") or 28),
         )
-        initial = terminal_manager.payload(workspace_id, terminal_id)
+        initial = _terminal_manager().payload(workspace_id, terminal_id)
     except (TypeError, ValueError):
         await websocket.close(code=4404, reason="Terminal not found")
         return
@@ -749,11 +754,11 @@ async def terminal_websocket(websocket: WebSocket, conversation_id: int, termina
         restart_count = int(initial.get("restart_count") or 0)
         while True:
             chunk, cursor, alive = await asyncio.to_thread(
-                terminal_manager.read_since, workspace_id, terminal_id, cursor, 0.25
+                _terminal_manager().read_since, workspace_id, terminal_id, cursor, 0.25
             )
             if chunk:
                 await websocket.send_json({"type": "output", "data": chunk})
-            current = terminal_manager.payload(workspace_id, terminal_id)
+            current = _terminal_manager().payload(workspace_id, terminal_id)
             current_restart_count = int(current.get("restart_count") or 0)
             if current_restart_count != restart_count:
                 restart_count = current_restart_count
@@ -776,14 +781,14 @@ async def terminal_websocket(websocket: WebSocket, conversation_id: int, termina
             if message_type == "input":
                 data = str(message.get("data") or "")[:16_384]
                 if data:
-                    await asyncio.to_thread(terminal_manager.write, workspace_id, terminal_id, data)
+                    await asyncio.to_thread(_terminal_manager().write, workspace_id, terminal_id, data)
             elif message_type == "eof":
-                await asyncio.to_thread(terminal_manager.end_of_input, workspace_id, terminal_id)
+                await asyncio.to_thread(_terminal_manager().end_of_input, workspace_id, terminal_id)
             elif message_type == "resize":
                 cols = int(message.get("cols") or 100)
                 rows = int(message.get("rows") or 28)
                 await asyncio.to_thread(
-                    terminal_manager.resize,
+                    _terminal_manager().resize,
                     workspace_id,
                     terminal_id,
                     cols,
@@ -816,7 +821,7 @@ def close_workspace_terminal(
     conv = require_conversation(db, user.id, conversation_id)
     ensure_conversation_workspace(db, conv)
     try:
-        terminal_manager.close(conv.workspace_id, terminal_id)
+        _terminal_manager().close(conv.workspace_id, terminal_id)
         return {"status": "closed"}
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -830,7 +835,7 @@ def delete_conversation(
 ) -> dict:
     conv = require_conversation(db, user.id, conversation_id)
     if conv.workspace_id:
-        terminal_manager.close_workspace(conv.workspace_id)
+        _terminal_manager().close_workspace(conv.workspace_id)
     conv.is_archived = True
     db.commit()
     return {"status": "archived"}

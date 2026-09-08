@@ -17,6 +17,7 @@ class Settings(BaseSettings):
 
     app_name: str = "CommChatBot"
     app_version: str = "0.8.0"
+    app_environment: str = "development"
     host: str = "0.0.0.0"
     port: int = 8765
     cors_origins: str = "http://127.0.0.1:5173,http://localhost:5173"
@@ -70,6 +71,9 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     jwt_expire_minutes: int = 30
     refresh_token_days: int = 30
+    refresh_cookie_name: str = "commchatbot_refresh"
+    refresh_cookie_secure: bool = False
+    refresh_cookie_samesite: str = "lax"
     password_reset_minutes: int = 15
     password_reset_debug: bool = True
     auth_rate_limit_window_seconds: int = 60
@@ -129,6 +133,7 @@ class Settings(BaseSettings):
     smtp_starttls: bool = True
     remote_runner_token: str = ""
     remote_require_isolation: bool = True
+    remote_job_max_attempts: int = 3
 
     sandbox_mode: str = "local"
     sandbox_image: str = "commchatbot-sandbox:0.8.0"
@@ -154,6 +159,25 @@ class Settings(BaseSettings):
     langfuse_secret_key: str = ""
     langfuse_host: str = "http://localhost:3000"
     observability_enabled: bool = True
+
+    def validate_deployment(self) -> None:
+        """Reject unsafe settings when explicitly running as production."""
+        if self.app_environment.casefold() not in {"production", "prod"}:
+            return
+        problems: list[str] = []
+        if len(self.jwt_secret_key) < 32 or self.jwt_secret_key.casefold() in {
+            "change-me", "replace-with-a-long-random-secret",
+            "change-me-to-a-random-jwt-secret",
+        }:
+            problems.append("JWT_SECRET_KEY must be a unique random value of at least 32 characters")
+        if not self.refresh_cookie_secure:
+            problems.append("REFRESH_COOKIE_SECURE must be true")
+        if self.password_reset_debug:
+            problems.append("PASSWORD_RESET_DEBUG must be false")
+        if "*" in {item.strip() for item in self.cors_origins.split(",")}:
+            problems.append("CORS_ORIGINS cannot contain '*' when credentials are enabled")
+        if problems:
+            raise RuntimeError("Unsafe production configuration: " + "; ".join(problems))
 
 
 @lru_cache

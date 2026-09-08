@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from sqlalchemy.orm import Session
 
 from ...platform.services.auth import (
     AuthRateLimitError,
     audit_auth,
-    auth_rate_limiter,
     consume_password_reset,
     create_password_reset,
     issue_session,
     revoke_refresh_token,
     rotate_refresh_token,
 )
+from ...bootstrap import get_container
 from ...infra.config import get_settings
 from ...platform.database import AuthAuditRecord, User, get_db
 from ...infra.security import hash_password, verify_password
@@ -46,7 +46,7 @@ def register(req: RegisterRequest, request: Request, db: Session = Depends(get_d
 
 
 @router.post("/login")
-def login(req: LoginRequest, request: Request, db: Session = Depends(get_db)) -> dict:
+def login(req: LoginRequest, request: Request, response: Response, db: Session = Depends(get_db)) -> dict:
     ip = _client_ip(request)
     rate_key = f"{ip}:{req.username}"
     _rate_limit("login", rate_key, get_settings().login_rate_limit)
@@ -62,29 +62,33 @@ def login(req: LoginRequest, request: Request, db: Session = Depends(get_db)) ->
             detail="invalid_credentials",
         )
         raise HTTPException(status_code=401, detail="Invalid username or password")
-    auth_rate_limiter.clear("login", rate_key)
+    get_container().auth_rate_limiter.clear("login", rate_key)
     session = issue_session(db, user, ip, request.headers.get("user-agent", ""))
+    _set_refresh_cookie(response, session.pop("refresh_token"))
     audit_auth(db, event="login", subject=user.username, ip_address=ip, success=True, user_id=user.id)
     return session
 
 
 @router.post("/refresh")
-def refresh(req: RefreshTokenRequest, request: Request, db: Session = Depends(get_db)) -> dict:
+def refresh(req: RefreshTokenRequest, request: Request, response: Response, db: Session = Depends(get_db)) -> dict:
     ip = _client_ip(request)
     _rate_limit("refresh", ip, 30)
-    rotated = rotate_refresh_token(db, req.refresh_token, ip, request.headers.get("user-agent", ""))
+    raw_token = req.refresh_token or request.cookies.get(get_settings().refresh_cookie_name, "")
+    rotated = rotate_refresh_token(db, raw_token, ip, request.headers.get("user-agent", ""))
     if not rotated:
         audit_auth(db, event="refresh", subject="unknown", ip_address=ip, success=False, detail="invalid_token")
         raise HTTPException(status_code=401, detail="Invalid or expired refresh token")
     user, session = rotated
+    _set_refresh_cookie(response, session.pop("refresh_token"))
     audit_auth(db, event="refresh", subject=user.username, ip_address=ip, success=True, user_id=user.id)
     return session
 
 
 @router.post("/logout")
-def logout(req: LogoutRequest, request: Request, db: Session = Depends(get_db)) -> dict:
+def logout(req: LogoutRequest, request: Request, response: Response, db: Session = Depends(get_db)) -> dict:
     ip = _client_ip(request)
-    user_id = revoke_refresh_token(db, req.refresh_token)
+    raw_token = req.refresh_token or request.cookies.get(get_settings().refresh_cookie_name, "")
+    user_id = revoke_refresh_token(db, raw_token) if raw_token else None
     user = db.query(User).filter(User.id == user_id).first() if user_id else None
     audit_auth(
         db,
@@ -94,6 +98,7 @@ def logout(req: LogoutRequest, request: Request, db: Session = Depends(get_db)) 
         success=bool(user_id),
         user_id=user_id,
     )
+    _clear_refresh_cookie(response)
     return {"status": "logged-out"}
 
 
@@ -114,7 +119,7 @@ def forgot_password(req: PasswordForgotRequest, request: Request, db: Session = 
 
 
 @router.post("/password/reset")
-def reset_password(req: PasswordResetRequest, request: Request, db: Session = Depends(get_db)) -> dict:
+def reset_password(req: PasswordResetRequest, request: Request, response: Response, db: Session = Depends(get_db)) -> dict:
     ip = _client_ip(request)
     _rate_limit("password-reset", ip, get_settings().password_reset_rate_limit)
     user = consume_password_reset(db, req.reset_token, req.new_password)
@@ -122,6 +127,7 @@ def reset_password(req: PasswordResetRequest, request: Request, db: Session = De
         audit_auth(db, event="password-reset", subject="unknown", ip_address=ip, success=False, detail="invalid_token")
         raise HTTPException(status_code=400, detail="Invalid or expired reset token")
     audit_auth(db, event="password-reset", subject=user.username, ip_address=ip, success=True, user_id=user.id)
+    _clear_refresh_cookie(response)
     return {"status": "password-reset"}
 
 
@@ -163,10 +169,40 @@ def _client_ip(request: Request) -> str:
 
 def _rate_limit(action: str, identity: str, limit: int) -> None:
     try:
-        auth_rate_limiter.check(action, identity, limit)
+        get_container().auth_rate_limiter.check(action, identity, limit)
     except AuthRateLimitError as exc:
         raise HTTPException(
             status_code=429,
             detail="Too many attempts. Try again later.",
             headers={"Retry-After": str(exc.retry_after)},
         ) from exc
+
+
+def _set_refresh_cookie(response: Response, token: str) -> None:
+    settings = get_settings()
+    same_site = _refresh_cookie_samesite()
+    response.set_cookie(
+        key=settings.refresh_cookie_name,
+        value=token,
+        max_age=max(1, settings.refresh_token_days) * 86_400,
+        httponly=True,
+        secure=settings.refresh_cookie_secure,
+        samesite=same_site,
+        path="/api/auth",
+    )
+
+
+def _clear_refresh_cookie(response: Response) -> None:
+    settings = get_settings()
+    response.delete_cookie(
+        settings.refresh_cookie_name,
+        path="/api/auth",
+        httponly=True,
+        secure=settings.refresh_cookie_secure,
+        samesite=_refresh_cookie_samesite(),
+    )
+
+
+def _refresh_cookie_samesite() -> str:
+    same_site = get_settings().refresh_cookie_samesite.casefold()
+    return same_site if same_site in {"lax", "strict", "none"} else "lax"

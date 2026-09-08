@@ -3,14 +3,15 @@ from __future__ import annotations
 import time
 
 from ...infra.config import get_settings
+from .lazy import LazyService
 from ..database import AgentTask, SessionLocal
 
 
 class DurableTaskQueue:
     """Redis wake-up queue with the database as the durable source of truth."""
 
-    def __init__(self) -> None:
-        self.settings = get_settings()
+    def __init__(self, settings=None) -> None:
+        self.settings = settings or get_settings()
         self._redis = None
 
     def enqueue(self, task_id: str) -> None:
@@ -66,4 +67,4 @@ class DurableTaskQueue:
         return self._redis or None
 
 
-task_queue = DurableTaskQueue()
+task_queue = LazyService(DurableTaskQueue)

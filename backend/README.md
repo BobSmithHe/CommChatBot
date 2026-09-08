@@ -99,9 +99,11 @@ Runtime safety and recovery:
 
 Authentication safety:
 
-- Short-lived access tokens and one-time rotating refresh tokens; logout and password reset revoke refresh sessions.
+- Short-lived access tokens and one-time rotating refresh tokens stored in a path-scoped HttpOnly cookie; logout and password reset revoke refresh sessions.
 - Redis-backed login/password-reset rate limiting with an in-process fallback.
 - One-time, expiring password reset tokens and per-user authentication audit events.
+- Security headers, request correlation ids, and no-store authentication responses.
+- `APP_ENVIRONMENT=production` rejects weak JWT secrets, insecure refresh cookies, debug reset tokens, and wildcard credentialed CORS.
 - `PASSWORD_RESET_DEBUG=true` returns a reset token only for direct loopback development. Disable it behind a production proxy and use an out-of-band delivery provider.
 
 Docker sandbox:

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 
 from ...infra.config import get_settings
 from ...infra.integrations import get_external_integrations
 from ...services import get_extension_registry, get_provider_registry
 from ...products.profiles import CHAT_PROFILE, CODING_PROFILE, apply_profile_overrides
+from ...platform.database import engine
 
 router = APIRouter()
 
@@ -14,6 +17,19 @@ router = APIRouter()
 def health() -> dict:
     settings = get_settings()
     return {"status": "ok", "app": settings.app_name, "version": settings.app_version}
+
+
+@router.get("/health/ready")
+def readiness(response: Response) -> dict:
+    """Deployment readiness: the durable database must accept a query."""
+    try:
+        get_settings().validate_deployment()
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+    except (RuntimeError, SQLAlchemyError) as exc:
+        response.status_code = 503
+        return {"status": "not-ready", "reason": type(exc).__name__}
+    return {"status": "ready"}
 
 
 @router.get("/health/integrations")

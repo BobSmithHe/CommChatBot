@@ -363,7 +363,7 @@ test("过期访问令牌只刷新一次并恢复登录", async ({ page }) => {
     access: localStorage.getItem("commchatbot.access_token"),
     refresh: localStorage.getItem("commchatbot.refresh_token"),
   }));
-  expect(tokens).toEqual({ access: "fresh-access", refresh: "fresh-refresh" });
+  expect(tokens).toEqual({ access: null, refresh: null });
 });
 
 

@@ -40,9 +40,13 @@ SAFE_COMMANDS = {
 class WorkspaceEditor:
     """Bounded text-file operations for the coding product mode."""
 
-    def __init__(self, root: str | Path | None = None) -> None:
+    def __init__(self, root: str | Path | None = None, *, lsp_manager=None) -> None:
         configured = root if root is not None else get_settings().workspace_dir
         self.root = Path(configured).resolve()
+        self.lsp_manager = lsp_manager
+
+    def language_service(self) -> WorkspaceLanguageService:
+        return WorkspaceLanguageService(self.root, manager=self.lsp_manager)
 
     def list_files(self, directory: str = ".", pattern: str = "*", limit: int = 200) -> str:
         target = self._resolve(directory)
@@ -272,7 +276,7 @@ class WorkspaceEditor:
         selected = list(dict.fromkeys(paths or self._changed_paths()))
         if not selected:
             selected = [line for line in self.list_files(pattern="*.py", limit=50).splitlines() if line]
-        service = WorkspaceLanguageService(self.root)
+        service = self.language_service()
         results: list[dict] = []
         for relative in selected[:50]:
             try:

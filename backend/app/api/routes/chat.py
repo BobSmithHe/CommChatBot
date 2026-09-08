@@ -8,10 +8,8 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 
 from ...infra.config import get_settings
+from ...bootstrap import get_container
 from ...platform.database import AgentTask, Message, RuntimeEventRecord, SessionLocal, User, get_db
-from ...platform.services.task_runtime import runtime_task_manager
-from ...platform.services.task_queue import task_queue
-from ...platform.services.event_bus import event_bus
 from ...services import get_chat_attachment_store
 from ...sse import sse
 from ..conversation_utils import conversation_history, ensure_conversation_workspace, get_or_create_conversation
@@ -35,6 +33,8 @@ async def upload_chat_attachment(
 
 @router.post("/stream")
 async def chat_stream(req: ChatRequest, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    container = get_container()
+    task_manager = container.task_manager
     if req.mode != "chatbot" and req.attachment_ids:
         raise HTTPException(status_code=400, detail="Attachments are only available in Chat mode")
     resume_state = None
@@ -50,10 +50,10 @@ async def chat_stream(req: ChatRequest, user: User = Depends(current_user), db: 
             raise HTTPException(status_code=404, detail="Task not found")
         if stored_task.mode != req.mode:
             raise HTTPException(status_code=409, detail="Task belongs to a different mode")
-        resume_state = runtime_task_manager.load_checkpoint(stored_task.id)
+        resume_state = task_manager.load_checkpoint(stored_task.id)
         if not resume_state:
             raise HTTPException(status_code=409, detail="Task has no resumable checkpoint")
-        task = runtime_task_manager.resume(stored_task.id)
+        task = task_manager.resume(stored_task.id)
         if not task:
             raise HTTPException(status_code=409, detail="Task is not resumable")
         conv = get_or_create_conversation(db, user.id, stored_task.conversation_id, stored_task.mode)
@@ -105,7 +105,7 @@ async def chat_stream(req: ChatRequest, user: User = Depends(current_user), db: 
             "system_context": req.system_context,
             "project_trusted": bool(conv.project_trusted),
         }
-        task = runtime_task_manager.create(
+        task = task_manager.create(
             user_id=user.id,
             conversation_id=conv.id,
             mode=req.mode,
@@ -116,7 +116,7 @@ async def chat_stream(req: ChatRequest, user: User = Depends(current_user), db: 
     if conv.mode == "coding-agent":
         ensure_conversation_workspace(db, conv)
 
-    task_queue.enqueue(task.id)
+    container.task_queue.enqueue(task.id)
 
     async def events():
         yield sse("task", {"task_id": task.id, "status": "running", "resumed": resumed})
@@ -128,7 +128,7 @@ async def chat_stream(req: ChatRequest, user: User = Depends(current_user), db: 
         terminal_statuses = {"completed", "failed", "cancelled", "interrupted"}
         while True:
             streamed = await asyncio.to_thread(
-                event_bus.read,
+                container.event_bus.read,
                 task.id,
                 stream_cursor,
                 block_ms=750,

@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from ...infra.config import get_settings
+from .lazy import LazyService
 
 
 class HookRunner:
@@ -68,4 +69,4 @@ class HookRunner:
         return results
 
 
-hook_runner = HookRunner()
+hook_runner = LazyService(HookRunner)

@@ -6,8 +6,6 @@ from collections.abc import Coroutine
 from typing import Any
 
 from .bootstrap import get_container
-from .platform.services.task_queue import task_queue
-from .extensions.builtin.memory import execute_memory_job, memory_job_queue
 from .platform.database import init_db
 
 
@@ -35,7 +33,7 @@ async def run_worker(*, initialize: bool = True) -> None:
     container = get_container()
     if initialize:
         init_db()
-    recovered = task_queue.wake_recovered()
+    recovered = container.task_queue.wake_recovered()
     concurrency = max(1, container.settings.agent_worker_concurrency)
     logger = logging.getLogger(__name__)
     logger.info("Agent worker ready; queued=%s concurrency=%s", recovered, concurrency)
@@ -47,7 +45,7 @@ async def run_worker(*, initialize: bool = True) -> None:
             if len(jobs) >= concurrency:
                 await asyncio.wait(jobs, return_when=asyncio.FIRST_COMPLETED)
                 continue
-            task_id = await asyncio.to_thread(task_queue.next, 2)
+            task_id = await asyncio.to_thread(container.task_queue.next, 2)
             if not task_id:
                 continue
             _start_job(jobs, container.execute_task(task_id))
@@ -65,7 +63,7 @@ async def run_worker(*, initialize: bool = True) -> None:
 
 async def run_memory_worker() -> None:
     container = get_container()
-    recovered = memory_job_queue.wake_recovered()
+    recovered = container.memory_job_queue.wake_recovered()
     concurrency = max(1, container.settings.memory_worker_concurrency)
     logger = logging.getLogger(__name__)
     logger.info("Memory worker ready; queued=%s concurrency=%s", recovered, concurrency)
@@ -76,10 +74,10 @@ async def run_memory_worker() -> None:
             if len(jobs) >= concurrency:
                 await asyncio.wait(jobs, return_when=asyncio.FIRST_COMPLETED)
                 continue
-            job_id = await asyncio.to_thread(memory_job_queue.next, 2)
+            job_id = await asyncio.to_thread(container.memory_job_queue.next, 2)
             if not job_id:
                 continue
-            _start_job(jobs, execute_memory_job(job_id))
+            _start_job(jobs, container.execute_memory_job(job_id))
             await asyncio.sleep(0)
     finally:
         for job in jobs:

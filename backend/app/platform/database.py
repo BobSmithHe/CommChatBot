@@ -97,7 +97,7 @@ class RuntimeEventRecord(Base):
     __tablename__ = "runtime_events"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    event_key = Column(String(32), nullable=True, index=True)
+    event_key = Column(String(32), nullable=True, unique=True, index=True)
     task_id = Column(String(32), ForeignKey("agent_tasks.id"), nullable=False, index=True)
     event_type = Column(String(40), nullable=False)
     content_json = Column(Text, nullable=True)
@@ -262,6 +262,12 @@ class RemoteJobRecord(Base):
     task_id = Column(String(32), nullable=True, index=True)
     command_json = Column(Text, nullable=False)
     status = Column(String(20), nullable=False, default="queued", index=True)
+    lease_token = Column(String(64), nullable=True, index=True)
+    lease_expires_at = Column(DateTime, nullable=True, index=True)
+    attempts = Column(Integer, nullable=False, default=0, server_default="0")
+    cancel_requested = Column(Boolean, nullable=False, default=False, server_default="0")
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
     output = Column(Text, nullable=True)
     exit_code = Column(Integer, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
@@ -431,6 +437,7 @@ def init_db(*, recover_tasks: bool = True) -> None:
     _migrate_agent_subtasks()
     _migrate_runtime_events()
     _migrate_automations()
+    _migrate_remote_jobs()
     if recover_tasks:
         _recover_interrupted_tasks()
     with SessionLocal() as db:
@@ -505,6 +512,12 @@ def _migrate_runtime_events() -> None:
         if "event_key" not in columns:
             connection.execute(text("ALTER TABLE runtime_events ADD COLUMN event_key VARCHAR(32)"))
         _create_index(connection, "ix_runtime_events_event_key", "runtime_events", "event_key")
+        connection.execute(text(
+            "DELETE FROM runtime_events WHERE event_key IS NOT NULL AND id NOT IN "
+            "(SELECT keep_id FROM (SELECT MIN(id) AS keep_id FROM runtime_events "
+            "WHERE event_key IS NOT NULL GROUP BY event_key) AS kept)"
+        ))
+        _create_index(connection, "ux_runtime_events_event_key", "runtime_events", "event_key", unique=True)
 
 
 def _migrate_automations() -> None:
@@ -514,6 +527,25 @@ def _migrate_automations() -> None:
             connection.execute(text("ALTER TABLE scheduled_automations ADD COLUMN rrule TEXT"))
         if "timezone" not in columns:
             connection.execute(text("ALTER TABLE scheduled_automations ADD COLUMN timezone VARCHAR(80) NOT NULL DEFAULT 'UTC'"))
+
+
+def _migrate_remote_jobs() -> None:
+    columns = {column["name"] for column in inspect(engine).get_columns("remote_jobs")}
+    with engine.begin() as connection:
+        if "lease_token" not in columns:
+            connection.execute(text("ALTER TABLE remote_jobs ADD COLUMN lease_token VARCHAR(64)"))
+        if "lease_expires_at" not in columns:
+            connection.execute(text("ALTER TABLE remote_jobs ADD COLUMN lease_expires_at DATETIME"))
+        if "attempts" not in columns:
+            connection.execute(text("ALTER TABLE remote_jobs ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"))
+        if "cancel_requested" not in columns:
+            connection.execute(text("ALTER TABLE remote_jobs ADD COLUMN cancel_requested BOOLEAN NOT NULL DEFAULT 0"))
+        if "started_at" not in columns:
+            connection.execute(text("ALTER TABLE remote_jobs ADD COLUMN started_at DATETIME"))
+        if "finished_at" not in columns:
+            connection.execute(text("ALTER TABLE remote_jobs ADD COLUMN finished_at DATETIME"))
+        _create_index(connection, "ix_remote_jobs_lease_token", "remote_jobs", "lease_token")
+        _create_index(connection, "ix_remote_jobs_lease_expires_at", "remote_jobs", "lease_expires_at")
 
 
 def _recover_interrupted_tasks() -> None:
@@ -533,10 +565,11 @@ def _recover_interrupted_tasks() -> None:
         )
 
 
-def _create_index(connection, name: str, table: str, column: str) -> None:
+def _create_index(connection, name: str, table: str, column: str, *, unique: bool = False) -> None:
     existing = {item["name"] for item in inspect(engine).get_indexes(table)}
     if name not in existing:
-        connection.execute(text(f"CREATE INDEX {name} ON {table} ({column})"))
+        qualifier = "UNIQUE " if unique else ""
+        connection.execute(text(f"CREATE {qualifier}INDEX {name} ON {table} ({column})"))
 
 
 def get_db():

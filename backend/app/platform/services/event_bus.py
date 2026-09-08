@@ -4,14 +4,17 @@ import atexit
 import json
 import logging
 import queue
+import sqlite3
 import threading
 import time
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from ...infra.config import get_settings
 from ..database import RuntimeEventRecord, SessionLocal
+from .lazy import LazyService
 
 
 @dataclass(frozen=True)
@@ -25,8 +28,8 @@ class RuntimeEventEnvelope:
 class RedisRuntimeEventBus:
     """Low-latency Redis Stream transport with MySQL as durable history."""
 
-    def __init__(self) -> None:
-        self.settings = get_settings()
+    def __init__(self, settings=None) -> None:
+        self.settings = settings or get_settings()
         self._redis = None
         self._retry_after = 0.0
 
@@ -117,35 +120,62 @@ class RedisRuntimeEventBus:
 
 
 class RuntimeEventBatchWriter:
-    """Persist runtime events in short batches without blocking Agent turns."""
+    """Persist runtime events in short batches through a crash-safe local outbox.
 
-    def __init__(self) -> None:
-        self.settings = get_settings()
-        self._queue: queue.Queue[RuntimeEventEnvelope | threading.Event] = queue.Queue()
+    Database outages must not turn batching into event loss. MySQL writes are
+    first recorded in a tiny SQLite outbox; SQLite writes use the same outbox
+    as a retry fallback. Successfully committed rows are removed and pending
+    rows are replayed automatically after a process restart.
+    """
+
+    def __init__(self, settings=None, *, spool_path: Path | None = None) -> None:
+        self.settings = settings or get_settings()
+        self._queue: queue.Queue[object | None] = queue.Queue()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._stop_event = threading.Event()
         self._closed = False
+        self._last_error_log = 0.0
+        self._spool = _RuntimeEventSpool(
+            spool_path or Path(self.settings.data_dir) / "runtime-event-outbox.sqlite3"
+        )
 
     def append(self, event: RuntimeEventEnvelope) -> None:
         # SQLite is primarily the deterministic test/single-process fallback.
-        if self.settings.database_backend.casefold() == "sqlite":
-            self._persist([event])
+        if self._closed:
+            raise RuntimeError("Runtime event writer is closed")
+        if self.settings.database_backend.casefold() == "sqlite" and self._persist([event]):
             return
+        self._spool.put(event)
         self._ensure_thread()
-        self._queue.put(event)
+        self._queue.put(object())
 
     def flush(self, timeout: float = 3.0) -> bool:
-        if not self._thread:
+        if self._spool.count() == 0:
             return True
-        marker = threading.Event()
-        self._queue.put(marker)
-        return marker.wait(timeout=max(0.1, timeout))
+        self._ensure_thread()
+        deadline = time.monotonic() + max(0.1, timeout)
+        self._queue.put(object())
+        while time.monotonic() < deadline:
+            if self._spool.count() == 0:
+                return True
+            time.sleep(0.025)
+        return self._spool.count() == 0
 
-    def close(self) -> None:
+    def close(self, timeout: float = 3.0) -> None:
         if self._closed:
             return
-        self.flush()
+        flushed = self.flush(timeout=timeout)
         self._closed = True
+        self._stop_event.set()
+        self._queue.put(None)
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=max(0.1, min(timeout, 3.0)))
+        if not flushed:
+            logging.getLogger(__name__).warning(
+                "Runtime event writer closed with %s durable outbox event(s); they will replay on restart",
+                self._spool.count(),
+            )
 
     def _ensure_thread(self) -> None:
         with self._lock:
@@ -159,36 +189,37 @@ class RuntimeEventBatchWriter:
             self._thread.start()
 
     def _run(self) -> None:
-        batch: list[RuntimeEventEnvelope] = []
         max_batch = max(1, self.settings.runtime_event_batch_size)
         flush_seconds = max(0.01, self.settings.runtime_event_flush_ms / 1000)
+        retry_delay = flush_seconds
         while not self._closed:
             try:
                 item = self._queue.get(timeout=flush_seconds)
             except queue.Empty:
-                item = None
-            if isinstance(item, RuntimeEventEnvelope):
-                batch.append(item)
-            marker = item if isinstance(item, threading.Event) else None
-            if batch and (len(batch) >= max_batch or item is None or marker is not None):
-                if self._persist(batch):
-                    batch.clear()
-                else:
-                    # Keep the batch in memory and retry. Redis continues to
-                    # serve live readers while the durable store recovers.
-                    time.sleep(min(1.0, flush_seconds * 2))
-                    if marker is not None:
-                        self._queue.put(marker)
-                        marker = None
-            if marker is not None:
-                marker.set()
+                item = object()
+            if item is None:
+                continue
+            batch = self._spool.take(max_batch)
+            if not batch:
+                continue
+            if self._persist(batch):
+                self._spool.delete([event.event_key for event in batch])
+                retry_delay = flush_seconds
+            else:
+                self._stop_event.wait(retry_delay)
+                retry_delay = min(5.0, max(flush_seconds, retry_delay * 2))
 
-    @staticmethod
-    def _persist(events: list[RuntimeEventEnvelope]) -> bool:
+    def _persist(self, events: list[RuntimeEventEnvelope]) -> bool:
         if not events:
             return True
         try:
             with SessionLocal() as db:
+                keys = [item.event_key for item in events]
+                existing = {
+                    row[0] for row in db.query(RuntimeEventRecord.event_key).filter(
+                        RuntimeEventRecord.event_key.in_(keys)
+                    ).all()
+                }
                 db.add_all([
                     RuntimeEventRecord(
                         event_key=item.event_key,
@@ -196,18 +227,64 @@ class RuntimeEventBatchWriter:
                         event_type=item.event_type,
                         content_json=item.content_json,
                     )
-                    for item in events
+                    for item in events if item.event_key not in existing
                 ])
                 db.commit()
             return True
         except Exception:
-            logging.getLogger(__name__).exception("Runtime event batch persistence failed; retrying")
+            now = time.monotonic()
+            if now - self._last_error_log >= 5:
+                logging.getLogger(__name__).exception("Runtime event batch persistence failed; retrying")
+                self._last_error_log = now
             return False
 
 
-event_bus = RedisRuntimeEventBus()
-event_batch_writer = RuntimeEventBatchWriter()
-atexit.register(event_batch_writer.close)
+class _RuntimeEventSpool:
+    """Small process-safe SQLite outbox shared by local API/worker processes."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as db:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute(
+                "CREATE TABLE IF NOT EXISTS events ("
+                "event_key TEXT PRIMARY KEY, task_id TEXT NOT NULL, "
+                "event_type TEXT NOT NULL, content_json TEXT)"
+            )
+
+    def put(self, event: RuntimeEventEnvelope) -> None:
+        with self._connect() as db:
+            db.execute(
+                "INSERT OR IGNORE INTO events(event_key,task_id,event_type,content_json) VALUES (?,?,?,?)",
+                (event.event_key, event.task_id, event.event_type, event.content_json),
+            )
+
+    def take(self, limit: int) -> list[RuntimeEventEnvelope]:
+        with self._connect() as db:
+            rows = db.execute(
+                "SELECT event_key,task_id,event_type,content_json FROM events ORDER BY rowid LIMIT ?",
+                (max(1, limit),),
+            ).fetchall()
+        return [RuntimeEventEnvelope(*row) for row in rows]
+
+    def delete(self, event_keys: list[str]) -> None:
+        if not event_keys:
+            return
+        with self._connect() as db:
+            db.executemany("DELETE FROM events WHERE event_key=?", ((key,) for key in event_keys))
+
+    def count(self) -> int:
+        with self._connect() as db:
+            return int(db.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+
+    def _connect(self) -> sqlite3.Connection:
+        return sqlite3.connect(self.path, timeout=5)
+
+
+event_bus = LazyService(RedisRuntimeEventBus)
+event_batch_writer = LazyService(RuntimeEventBatchWriter)
+atexit.register(event_batch_writer.close_if_created)
 
 
 def make_event(task_id: str, event_type: str, content: Any = None) -> RuntimeEventEnvelope:

@@ -18,9 +18,10 @@ WORKSPACE_ID_PATTERN = re.compile(r"^[a-f0-9]{32}$")
 class ConversationWorkspaceManager:
     """Creates and resolves an isolated filesystem root for each coding conversation."""
 
-    def __init__(self, root: str | Path | None = None) -> None:
+    def __init__(self, root: str | Path | None = None, *, editor_factory=None) -> None:
         configured = root if root is not None else get_settings().coding_workspace_dir
         self.root = Path(configured).resolve()
+        self.editor_factory = editor_factory or WorkspaceEditor
         self.root.mkdir(parents=True, exist_ok=True)
 
     def create(self) -> str:
@@ -92,7 +93,7 @@ class ConversationWorkspaceManager:
         target = self._path(workspace_id, create=True)
         if not (target / ".git").exists():
             self._initialize_git(target)
-        return WorkspaceEditor(target)
+        return self.editor_factory(target)
 
     def _path(self, workspace_id: str, *, create: bool) -> Path:
         if not WORKSPACE_ID_PATTERN.fullmatch(workspace_id or ""):

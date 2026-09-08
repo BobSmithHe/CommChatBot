@@ -46,11 +46,12 @@ def test_redis_event_bus_preserves_structured_events_and_cursor() -> None:
     }]
 
 
-def test_runtime_event_writer_batches_and_flushes() -> None:
-    writer = RuntimeEventBatchWriter()
-    writer.settings = SimpleNamespace(
+def test_runtime_event_writer_batches_and_flushes(tmp_path) -> None:
+    settings = SimpleNamespace(
         database_backend="mysql", runtime_event_batch_size=10, runtime_event_flush_ms=10_000,
+        data_dir=str(tmp_path),
     )
+    writer = RuntimeEventBatchWriter(settings)
     persisted = []
     def persist(events):
         persisted.extend(events)
@@ -62,6 +63,29 @@ def test_runtime_event_writer_batches_and_flushes() -> None:
     assert writer.flush(timeout=2)
     writer.close()
     assert [item.event_type for item in persisted] == ["status", "status"]
+
+
+def test_runtime_event_writer_replays_durable_outbox_after_failure(tmp_path) -> None:
+    settings = SimpleNamespace(
+        database_backend="mysql", runtime_event_batch_size=10,
+        runtime_event_flush_ms=10, data_dir=str(tmp_path),
+    )
+    spool = tmp_path / "runtime-events.sqlite3"
+    first = RuntimeEventBatchWriter(settings, spool_path=spool)
+    first._persist = lambda _events: False
+    event = make_event("b" * 32, "status", "survive restart")
+    first.append(event)
+    assert first.flush(timeout=0.1) is False
+    first.close(timeout=0.1)
+    assert first._spool.count() == 1
+
+    persisted = []
+    second = RuntimeEventBatchWriter(settings, spool_path=spool)
+    second._persist = lambda events: persisted.extend(events) or True
+    assert second.flush(timeout=2)
+    second.close()
+    assert [item.event_key for item in persisted] == [event.event_key]
+    assert second._spool.count() == 0
 
 
 def test_skill_runtime_progressive_activation_and_resource_access(tmp_path) -> None:

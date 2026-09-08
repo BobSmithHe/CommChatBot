@@ -1,28 +1,36 @@
 const JSON_HEADERS = { "Content-Type": "application/json" };
 const ACCESS_TOKEN_KEY = "commchatbot.access_token";
 const REFRESH_TOKEN_KEY = "commchatbot.refresh_token";
+let accessToken = localStorage.getItem(ACCESS_TOKEN_KEY) || "";
+let legacyRefreshToken = localStorage.getItem(REFRESH_TOKEN_KEY) || "";
+localStorage.removeItem(ACCESS_TOKEN_KEY);
+localStorage.removeItem(REFRESH_TOKEN_KEY);
 let refreshPromise = null;
 
 export function getAuthToken() {
-  return localStorage.getItem(ACCESS_TOKEN_KEY) || "";
+  return accessToken;
 }
 
 export function setAuthToken(token) {
-  if (token) localStorage.setItem(ACCESS_TOKEN_KEY, token);
-  else localStorage.removeItem(ACCESS_TOKEN_KEY);
+  accessToken = token || "";
 }
 
 export function getRefreshToken() {
-  return localStorage.getItem(REFRESH_TOKEN_KEY) || "";
+  return legacyRefreshToken;
 }
 
 export function setAuthSession(session) {
   setAuthToken(session?.access_token || "");
-  if (session?.refresh_token) localStorage.setItem(REFRESH_TOKEN_KEY, session.refresh_token);
-  else localStorage.removeItem(REFRESH_TOKEN_KEY);
+  // New servers rotate the refresh token in an HttpOnly cookie. A token in
+  // the response only exists while migrating an older deployment; consume it
+  // once instead of keeping a stale token that would override the cookie on
+  // the next refresh attempt.
+  legacyRefreshToken = session?.refresh_token || "";
 }
 
 export function clearAuthSession() {
+  accessToken = "";
+  legacyRefreshToken = "";
   localStorage.removeItem(ACCESS_TOKEN_KEY);
   localStorage.removeItem(REFRESH_TOKEN_KEY);
 }
@@ -123,14 +131,14 @@ async function consumeSse(body, onEvent) {
 }
 
 async function authorizedFetch(path, options = {}, retry = true) {
-  const nextOptions = { ...options, headers: headers(options.headers || {}) };
+  const nextOptions = { credentials: "include", ...options, headers: headers(options.headers || {}) };
   let response = await fetch(path, nextOptions);
-  if (response.status !== 401 || !retry || path === "/api/auth/refresh" || !getRefreshToken()) {
+  if (response.status !== 401 || !retry || (path.startsWith("/api/auth/") && path !== "/api/auth/me")) {
     return response;
   }
   const refreshed = await refreshAccessToken();
   if (!refreshed) return response;
-  response = await fetch(path, { ...options, headers: headers(options.headers || {}) });
+  response = await fetch(path, { credentials: "include", ...options, headers: headers(options.headers || {}) });
   return response;
 }
 
@@ -140,11 +148,13 @@ async function refreshAccessToken() {
       try {
         const response = await fetch("/api/auth/refresh", {
           method: "POST",
+          credentials: "include",
           headers: JSON_HEADERS,
-          body: JSON.stringify({ refresh_token: getRefreshToken() }),
+          body: JSON.stringify(legacyRefreshToken ? { refresh_token: legacyRefreshToken } : {}),
         });
         if (!response.ok) throw new Error("Session refresh failed");
         setAuthSession(await response.json());
+        legacyRefreshToken = "";
         return true;
       } catch {
         clearAuthSession();

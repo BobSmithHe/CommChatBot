@@ -21,7 +21,8 @@ from ..database import (
     TaskMailboxMessage,
 )
 from ...infra.integrations import get_external_integrations
-from .event_bus import event_batch_writer, event_bus, make_event
+from .event_bus import RedisRuntimeEventBus, RuntimeEventBatchWriter, event_batch_writer, event_bus, make_event
+from .lazy import LazyService
 from ...agent_runtime.host import TaskCancelled
 
 
@@ -47,9 +48,16 @@ class PendingApproval:
 class RuntimeTaskManager:
     """Process-local controls backed by durable task/event rows."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        runtime_event_bus: RedisRuntimeEventBus | None = None,
+        runtime_event_writer: RuntimeEventBatchWriter | None = None,
+    ) -> None:
         self._tasks: dict[str, LiveTask] = {}
         self._approvals: dict[str, PendingApproval] = {}
+        self.event_bus = runtime_event_bus or event_bus
+        self.event_writer = runtime_event_writer or event_batch_writer
 
     def create(
         self, *, user_id: int, conversation_id: int, mode: str, prompt: str,
@@ -88,8 +96,8 @@ class RuntimeTaskManager:
 
     def append_event(self, task_id: str, event_type: str, content: Any = None) -> None:
         event = make_event(task_id, event_type, content)
-        event_bus.publish(event)
-        event_batch_writer.append(event)
+        self.event_writer.append(event)
+        self.event_bus.publish(event)
 
     def create_subtask(
         self,
@@ -385,7 +393,7 @@ class RuntimeTaskManager:
         # Ensure the durable history catches up before terminal task state is
         # visible to API readers. Live clients already received events through
         # Redis Streams and are not held up by this flush.
-        event_batch_writer.flush()
+        self.event_writer.flush()
         with SessionLocal() as db:
             row = db.query(AgentTask).filter(AgentTask.id == task_id).first()
             if row:
@@ -534,4 +542,4 @@ class RuntimeTaskManager:
         return "approve"
 
 
-runtime_task_manager = RuntimeTaskManager()
+runtime_task_manager = LazyService(RuntimeTaskManager)

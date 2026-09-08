@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from app.platform.database import RemoteJobRecord, RemoteRunnerRecord, SessionLocal
 from app.infra.config import get_settings
 from app.agent_runtime import Tool
+from app.platform.services.lazy import LazyService
 
 
 class RemoteExecutionService:
@@ -61,6 +62,8 @@ class RemoteExecutionService:
             row = db.query(RemoteJobRecord).filter(RemoteJobRecord.id == job_id).first()
             if row and row.status in {"queued", "running"}:
                 row.status = "cancelled"
+                row.cancel_requested = True
+                row.finished_at = datetime.utcnow()
                 db.commit()
         return json.dumps({"job_id": job_id, "exit_code": -1, "timed_out": True, "output": "Remote job timed out"})
 
@@ -93,4 +96,4 @@ class RemoteExecutionService:
         ]
 
 
-remote_execution_service = RemoteExecutionService()
+remote_execution_service = LazyService(RemoteExecutionService)

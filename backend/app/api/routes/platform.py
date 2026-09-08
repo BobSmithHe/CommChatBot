@@ -5,16 +5,15 @@ import hashlib
 import hmac
 import secrets
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
+from sqlalchemy import and_, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...bootstrap import get_container
 from ...platform.services.scheduler import next_run_at
-from ...extensions.builtin.remote_execution import remote_execution_service
-from ...extensions.builtin.github import github_integration
 from ...platform.services.notifications import enqueue_notification_deliveries, validate_endpoint
 from ...infra.config import get_settings
 from ...platform.database import (
@@ -24,7 +23,7 @@ from ...platform.database import (
 )
 from ..deps import current_user
 from ..schemas import (
-    AutomationCreateRequest, AutomationUpdateRequest, RemoteJobCompleteRequest,
+    AutomationCreateRequest, AutomationUpdateRequest, RemoteJobCompleteRequest, RemoteJobLeaseRequest,
     GitHubInlineReviewRequest, GitHubSubscriptionRequest,
     NotificationEndpointCreateRequest, NotificationEndpointUpdateRequest,
     RemoteJobCreateRequest, RemoteRunnerHeartbeatRequest,
@@ -235,13 +234,13 @@ def list_notification_deliveries(user: User = Depends(current_user), db: Session
 
 @router.get("/remote/runners")
 def list_remote_runners(_user: User = Depends(current_user)) -> list[dict]:
-    return remote_execution_service.online_runners()
+    return get_container().remote_execution_service.online_runners()
 
 
 @router.post("/remote/jobs")
 def create_remote_job(req: RemoteJobCreateRequest, user: User = Depends(current_user)) -> dict:
     try:
-        job_id = remote_execution_service.create_job(
+        job_id = get_container().remote_execution_service.create_job(
             user_id=user.id, runner_id=req.runner_id,
             command={"argv": req.argv, "timeout": req.timeout},
         )
@@ -253,7 +252,12 @@ def create_remote_job(req: RemoteJobCreateRequest, user: User = Depends(current_
 @router.get("/remote/jobs")
 def list_remote_jobs(user: User = Depends(current_user), db: Session = Depends(get_db)) -> list[dict]:
     rows = db.query(RemoteJobRecord).filter(RemoteJobRecord.user_id == user.id).order_by(RemoteJobRecord.created_at.desc()).limit(100).all()
-    return [{"id": row.id, "runner_id": row.runner_id, "task_id": row.task_id, "status": row.status, "exit_code": row.exit_code, "output": row.output} for row in rows]
+    return [{
+        "id": row.id, "runner_id": row.runner_id, "task_id": row.task_id,
+        "status": row.status, "exit_code": row.exit_code, "output": row.output,
+        "attempts": row.attempts, "cancel_requested": row.cancel_requested,
+        "lease_expires_at": row.lease_expires_at.isoformat() if row.lease_expires_at else None,
+    } for row in rows]
 
 
 def _require_runner_token(token: str | None) -> None:
@@ -281,29 +285,120 @@ def runner_heartbeat(req: RemoteRunnerHeartbeatRequest, x_runner_token: str | No
 @router.post("/remote/runner/jobs/claim")
 def claim_remote_job(runner_id: str, x_runner_token: str | None = Header(default=None), db: Session = Depends(get_db)) -> dict:
     _require_runner_token(x_runner_token)
+    now = datetime.utcnow()
+    max_attempts = max(1, get_settings().remote_job_max_attempts)
+    # Do not leave poison jobs permanently in ``running`` after every runner
+    # assigned to them has disappeared.
+    db.query(RemoteJobRecord).filter(
+        RemoteJobRecord.runner_id == runner_id,
+        RemoteJobRecord.status == "running",
+        RemoteJobRecord.lease_expires_at < now,
+        RemoteJobRecord.attempts >= max_attempts,
+    ).update({
+        RemoteJobRecord.status: "failed",
+        RemoteJobRecord.output: "Remote runner lease expired too many times",
+        RemoteJobRecord.exit_code: -1,
+        RemoteJobRecord.finished_at: now,
+        RemoteJobRecord.lease_expires_at: None,
+    }, synchronize_session=False)
+    db.commit()
     row = db.query(RemoteJobRecord).filter(
-        RemoteJobRecord.runner_id == runner_id, RemoteJobRecord.status == "queued",
+        RemoteJobRecord.runner_id == runner_id,
+        RemoteJobRecord.attempts < max_attempts,
+        or_(
+            RemoteJobRecord.status == "queued",
+            and_(
+                RemoteJobRecord.status == "running",
+                RemoteJobRecord.lease_expires_at.is_not(None),
+                RemoteJobRecord.lease_expires_at < now,
+            ),
+        ),
     ).order_by(RemoteJobRecord.created_at).first()
     if not row:
         return {"job": None}
-    updated = db.query(RemoteJobRecord).filter(
-        RemoteJobRecord.id == row.id, RemoteJobRecord.status == "queued",
-    ).update({RemoteJobRecord.status: "running"}, synchronize_session=False)
+    previous_status = row.status
+    previous_lease = row.lease_token
+    previous_attempts = int(row.attempts or 0)
+    lease_token = secrets.token_urlsafe(32)
+    lease_expires_at = now + timedelta(seconds=45)
+    claim_query = db.query(RemoteJobRecord).filter(
+        RemoteJobRecord.id == row.id,
+        RemoteJobRecord.status == previous_status,
+        RemoteJobRecord.lease_token == previous_lease if previous_lease is not None else RemoteJobRecord.lease_token.is_(None),
+    )
+    if previous_status == "running":
+        # A heartbeat may have renewed the lease after the candidate SELECT.
+        # Re-check expiry in the compare-and-swap so a live runner cannot have
+        # its job stolen by a concurrent claim request.
+        claim_query = claim_query.filter(RemoteJobRecord.lease_expires_at < now)
+    updated = claim_query.update({
+        RemoteJobRecord.status: "running",
+        RemoteJobRecord.lease_token: lease_token,
+        RemoteJobRecord.lease_expires_at: lease_expires_at,
+        RemoteJobRecord.attempts: RemoteJobRecord.attempts + 1,
+        RemoteJobRecord.cancel_requested: False,
+        RemoteJobRecord.started_at: now,
+    }, synchronize_session=False)
     db.commit()
     if not updated:
         return {"job": None}
-    return {"job": {"id": row.id, **json.loads(row.command_json)}}
+    return {"job": {
+        "id": row.id, "lease_token": lease_token,
+        "lease_seconds": 45, "attempt": previous_attempts + 1,
+        **json.loads(row.command_json),
+    }}
+
+
+@router.post("/remote/runner/jobs/{job_id}/heartbeat")
+def heartbeat_remote_job(
+    job_id: str, req: RemoteJobLeaseRequest,
+    x_runner_token: str | None = Header(default=None), db: Session = Depends(get_db),
+) -> dict:
+    _require_runner_token(x_runner_token)
+    row = db.query(RemoteJobRecord).filter(
+        RemoteJobRecord.id == job_id,
+        RemoteJobRecord.runner_id == req.runner_id,
+        RemoteJobRecord.lease_token == req.lease_token,
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Remote job lease not found")
+    if row.status != "running" or row.cancel_requested:
+        return {"status": row.status, "action": "cancel"}
+    if row.lease_expires_at is None or row.lease_expires_at < datetime.utcnow():
+        raise HTTPException(status_code=409, detail="Remote job lease expired")
+    heartbeat_at = datetime.utcnow()
+    row.lease_expires_at = heartbeat_at + timedelta(seconds=45)
+    db.query(RemoteRunnerRecord).filter(RemoteRunnerRecord.id == req.runner_id).update({
+        RemoteRunnerRecord.last_seen_at: heartbeat_at,
+        RemoteRunnerRecord.status: "online",
+    }, synchronize_session=False)
+    db.commit()
+    return {"status": "running", "action": "continue", "lease_seconds": 45}
 
 
 @router.post("/remote/runner/jobs/{job_id}/complete")
 def complete_remote_job(job_id: str, req: RemoteJobCompleteRequest, x_runner_token: str | None = Header(default=None), db: Session = Depends(get_db)) -> dict:
     _require_runner_token(x_runner_token)
-    row = db.query(RemoteJobRecord).filter(RemoteJobRecord.id == job_id, RemoteJobRecord.status == "running").first()
+    row = db.query(RemoteJobRecord).filter(
+        RemoteJobRecord.id == job_id,
+        RemoteJobRecord.runner_id == req.runner_id,
+        RemoteJobRecord.lease_token == req.lease_token,
+        RemoteJobRecord.status == "running",
+        RemoteJobRecord.lease_expires_at >= datetime.utcnow(),
+    ).first()
     if not row:
         raise HTTPException(status_code=404, detail="Running remote job not found")
+    if row.cancel_requested:
+        raise HTTPException(status_code=409, detail="Remote job was cancelled")
     row.output = req.output
     row.exit_code = req.exit_code
     row.status = "completed" if req.exit_code == 0 else "failed"
+    row.finished_at = datetime.utcnow()
+    row.lease_expires_at = None
+    db.query(RemoteRunnerRecord).filter(RemoteRunnerRecord.id == req.runner_id).update({
+        RemoteRunnerRecord.last_seen_at: row.finished_at,
+        RemoteRunnerRecord.status: "online",
+    }, synchronize_session=False)
     db.commit()
     return {"status": row.status}
 
@@ -348,7 +443,7 @@ def delete_github_subscription(subscription_id: str, user: User = Depends(curren
 @router.post("/github/reviews")
 async def submit_github_review(req: GitHubInlineReviewRequest, _user: User = Depends(current_user)) -> dict:
     try:
-        result = await github_integration.submit_review(
+        result = await get_container().github_integration.submit_review(
             req.repository, number=req.number, body=req.body, event=req.event,
             commit_id=req.commit_id, comments=req.comments,
         )

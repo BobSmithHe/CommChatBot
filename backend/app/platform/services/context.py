@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from ...infra.config import get_settings
 from ..database import Conversation, Message
 from ...providers import LLMMessage, ModelProvider
+from .lazy import LazyService
 
 
 def estimate_tokens(value: Any) -> int:
@@ -38,8 +39,8 @@ def truncate_to_tokens(value: Any, max_tokens: int) -> str:
 
 
 class ConversationContextManager:
-    def __init__(self) -> None:
-        self.settings = get_settings()
+    def __init__(self, settings=None) -> None:
+        self.settings = settings or get_settings()
 
     def prepare(self, db: Session, conversation_id: int) -> list[dict]:
         conversation = db.query(Conversation).filter(Conversation.id == conversation_id).first()
@@ -207,4 +208,4 @@ async def compact_llm_messages(
         )
 
 
-context_manager = ConversationContextManager()
+context_manager = LazyService(ConversationContextManager)

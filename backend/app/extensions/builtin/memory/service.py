@@ -8,7 +8,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from sqlalchemy import or_
@@ -16,8 +16,14 @@ from sqlalchemy.exc import IntegrityError
 
 from app.infra.config import get_settings
 from app.platform.database import MemoryRecord, MemorySettingsRecord, SessionLocal
+from app.platform.services.lazy import LazyService
 from app.providers import LLMMessage, ModelProvider
 from app.extensions.support.embeddings import get_embedding_model
+
+
+def _utc_now() -> datetime:
+    """UTC-naive timestamp for the existing database DateTime columns."""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 MEMORY_SCOPES = {"user", "project", "conversation", "task"}
@@ -275,7 +281,7 @@ class MemoryService:
                     row.expires_at = expires_at
                     row.metadata_json = json.dumps(metadata or {}, ensure_ascii=False)
                     row.is_active = True
-                    row.updated_at = datetime.utcnow()
+                    row.updated_at = _utc_now()
                     db.commit()
                     db.refresh(row)
                     payload = self._payload(row)
@@ -367,7 +373,7 @@ class MemoryService:
 
     def purge_expired(self, user_id: int | None = None) -> int:
         """Permanently remove TTL-expired rows and their semantic mirrors."""
-        now = datetime.utcnow()
+        now = _utc_now()
         with SessionLocal() as db:
             statement = db.query(MemoryRecord).filter(
                 MemoryRecord.expires_at.is_not(None),
@@ -411,7 +417,7 @@ class MemoryService:
             targets.append(self.project_target(project_identity))
         if not targets:
             return []
-        now = datetime.utcnow()
+        now = _utc_now()
         with SessionLocal() as db:
             rows = db.query(MemoryRecord).filter(
                 MemoryRecord.user_id == user_id,
@@ -572,7 +578,7 @@ class MemoryService:
                     confidence=confidence,
                     source_type="auto",
                     source_task_id=task_id,
-                    expires_at=datetime.utcnow() + timedelta(days=ttl_days) if ttl_days else None,
+                    expires_at=_utc_now() + timedelta(days=ttl_days) if ttl_days else None,
                     metadata={
                         "extractor_model": model,
                         "merged_semantically": bool(candidate),
@@ -687,4 +693,4 @@ class MemoryService:
         }
 
 
-memory_service = MemoryService()
+memory_service = LazyService(MemoryService)

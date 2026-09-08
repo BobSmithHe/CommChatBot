@@ -8,8 +8,8 @@ from dateutil.rrule import rrulestr
 
 from ..database import Conversation, Message, ScheduledAutomationRecord, SessionLocal
 from ..ports import ConversationAccessPort
-from .task_runtime import runtime_task_manager
-from .task_queue import task_queue
+from .task_runtime import RuntimeTaskManager, runtime_task_manager
+from .task_queue import DurableTaskQueue, task_queue
 
 
 def next_run_at(*, interval_seconds: int, rrule: str | None, timezone: str, after: datetime | None = None) -> datetime:
@@ -37,8 +37,17 @@ def next_run_at(*, interval_seconds: int, rrule: str | None, timezone: str, afte
 class AutomationScheduler:
     """Durable interval/RRULE scheduler; executions reuse the Agent task queue."""
 
-    def __init__(self, conversations: ConversationAccessPort, *, poll_seconds: float = 2.0) -> None:
+    def __init__(
+        self,
+        conversations: ConversationAccessPort,
+        *,
+        task_manager: RuntimeTaskManager | None = None,
+        queue: DurableTaskQueue | None = None,
+        poll_seconds: float = 2.0,
+    ) -> None:
         self.conversations = conversations
+        self.task_manager = task_manager or runtime_task_manager
+        self.queue = queue or task_queue
         self.poll_seconds = max(0.5, poll_seconds)
 
     def tick(self) -> int:
@@ -96,7 +105,7 @@ class AutomationScheduler:
                         "use_web": False, "system_context": "This run was started by a scheduled automation.",
                         "project_trusted": project_trusted, "automation_id": automation_id,
                     }
-                task = runtime_task_manager.create(
+                task = self.task_manager.create(
                     user_id=user_id, conversation_id=conversation_id, mode=mode,
                     prompt=prompt, status="queued", request=request,
                 )
@@ -105,7 +114,7 @@ class AutomationScheduler:
                     if row:
                         row.last_task_id = task.id
                         db.commit()
-                task_queue.enqueue(task.id)
+                self.queue.enqueue(task.id)
                 created += 1
             except Exception:
                 continue
